@@ -2,11 +2,11 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(windows))]
 use std::sync::Arc;
 #[cfg(not(windows))]
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rmcp::model::{Annotations, CallToolResult, ContentBlock, TextContent};
@@ -17,17 +17,17 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::OnceCell;
 #[cfg(not(windows))]
 use tokio::task::JoinHandle;
-use tokio_stream::{wrappers::SplitStream, StreamExt};
+use tokio_stream::{StreamExt, wrappers::SplitStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::tool_execution::ToolCallNotificationEmitter;
 use crate::subprocess::SubprocessExt;
 
 pub use super::shell_output_streaming::{
-    parse_shell_output_notification, ShellOutputNotificationChunk, ShellOutputNotificationParams,
-    ShellOutputStream, DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD,
+    DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD, ShellOutputNotificationChunk,
+    ShellOutputNotificationParams, ShellOutputStream, parse_shell_output_notification,
 };
-use super::shell_output_streaming::{ShellOutputBatcher, SHELL_LIVE_OUTPUT_FLUSH_INTERVAL};
+use super::shell_output_streaming::{SHELL_LIVE_OUTPUT_FLUSH_INTERVAL, ShellOutputBatcher};
 
 /// Check if the current process is running inside a Flatpak sandbox.
 ///
@@ -554,6 +554,94 @@ fn resolve_shell_timeout(timeout_secs: Option<u64>) -> u64 {
     })
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ShellTerminationScope {
+    ProcessGroup,
+    DirectChild,
+}
+
+#[cfg(unix)]
+fn shell_termination_scope() -> ShellTerminationScope {
+    // `flatpak-spawn --host` launches the shell on the host, outside the
+    // sandbox-side process group that Tokio can create and signal. Do not
+    // promise descendant cleanup across that boundary.
+    if is_flatpak() {
+        ShellTerminationScope::DirectChild
+    } else {
+        ShellTerminationScope::ProcessGroup
+    }
+}
+
+#[cfg(unix)]
+fn configure_shell_termination_scope(
+    command: &mut tokio::process::Command,
+    scope: ShellTerminationScope,
+) {
+    if matches!(scope, ShellTerminationScope::ProcessGroup) {
+        command.process_group(0);
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_shell_process(
+    child: &mut tokio::process::Child,
+    scope: ShellTerminationScope,
+) -> Result<(), String> {
+    let termination_result = match scope {
+        ShellTerminationScope::ProcessGroup => child.id().map_or_else(
+            || Err("Failed to determine shell process group".to_string()),
+            |pid| {
+                // The directly spawned shell is the process-group leader. It has not
+                // been reaped yet, so this group ID cannot have been reused.
+                let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                let error = std::io::Error::last_os_error();
+                if result == 0 || error.raw_os_error() == Some(libc::ESRCH) {
+                    Ok(())
+                } else {
+                    Err(format!("Failed to kill shell process group {pid}: {error}"))
+                }
+            },
+        ),
+        ShellTerminationScope::DirectChild => child
+            .start_kill()
+            .map_err(|error| format!("Failed to kill shell command: {error}")),
+    };
+    let wait_result = child
+        .wait()
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Failed waiting on terminated shell command: {error}"));
+
+    match (termination_result, wait_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(termination_error), Ok(())) => Err(termination_error),
+        (Ok(()), Err(wait_error)) => Err(wait_error),
+        (Err(termination_error), Err(wait_error)) => {
+            Err(format!("{termination_error}; {wait_error}"))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_shell_process(child: &mut tokio::process::Child) -> Result<(), String> {
+    let kill_result = child
+        .start_kill()
+        .map_err(|error| format!("Failed to kill shell command: {error}"));
+    let wait_result = child
+        .wait()
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Failed waiting on terminated shell command: {error}"));
+
+    match (kill_result, wait_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(kill_error), Ok(())) => Err(kill_error),
+        (Ok(()), Err(wait_error)) => Err(wait_error),
+        (Err(kill_error), Err(wait_error)) => Err(format!("{kill_error}; {wait_error}")),
+    }
+}
+
 async fn run_command(
     command_line: &str,
     timeout_secs: Option<u64>,
@@ -566,10 +654,14 @@ async fn run_command(
     let timeout_secs = Some(resolve_shell_timeout(timeout_secs));
 
     let mut command = build_shell_command(command_line, working_dir, login_path, session_id);
+    #[cfg(unix)]
+    let termination_scope = shell_termination_scope();
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.stdin(Stdio::null());
+    #[cfg(unix)]
+    configure_shell_termination_scope(&mut command, termination_scope);
 
     let mut child = command
         .spawn()
@@ -602,14 +694,18 @@ async fn run_command(
                     .code(),
                 Err(_) => {
                     timed_out = true;
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    #[cfg(unix)]
+                    terminate_shell_process(&mut child, termination_scope).await?;
+                    #[cfg(not(unix))]
+                    terminate_shell_process(&mut child).await?;
                     None
                 }
             },
             _ = cancellation_token.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                #[cfg(unix)]
+                terminate_shell_process(&mut child, termination_scope).await?;
+                #[cfg(not(unix))]
+                terminate_shell_process(&mut child).await?;
                 None
             }
         }
@@ -619,8 +715,10 @@ async fn run_command(
                 .map_err(|error| format!("Failed waiting on shell command: {}", error))?
                 .code(),
             _ = cancellation_token.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                #[cfg(unix)]
+                terminate_shell_process(&mut child, termination_scope).await?;
+                #[cfg(not(unix))]
+                terminate_shell_process(&mut child).await?;
                 None
             }
         }
@@ -1089,40 +1187,104 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    async fn wait_for_pids(path: &std::path::Path) -> (libc::pid_t, libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pids) = std::fs::read_to_string(path) {
+                    let mut pids = pids.split_whitespace();
+                    if let (Some(shell_pid), Some(descendant_pid)) = (pids.next(), pids.next()) {
+                        return (
+                            shell_pid.parse().expect("shell pid should be numeric"),
+                            descendant_pid
+                                .parse()
+                                .expect("descendant pid should be numeric"),
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell command should report its pid")
+    }
+
+    #[cfg(unix)]
+    async fn assert_pid_exits(pid: libc::pid_t) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant should be killed with its shell process group");
+    }
+
+    #[cfg(unix)]
+    fn descendant_command(pid_file: &std::path::Path) -> String {
+        format!(
+            "sleep 30 & printf '%s %s\\n' $$ $! > {} && wait",
+            pid_file.display()
+        )
+    }
+
+    #[cfg(unix)]
+    async fn assert_task_completes<T>(task: tokio::task::JoinHandle<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("shell task should complete shortly after cancellation or timeout")
+            .expect("shell task should not panic")
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn shell_kills_child_on_cancellation() {
+    async fn shell_cancellation_kills_descendants() {
+        if is_flatpak() {
+            return;
+        }
+
+        let pid_file = tempfile::NamedTempFile::new().unwrap();
         let tool = ShellTool::new_for_test().unwrap();
         let token = CancellationToken::new();
-        let token_clone = token.clone();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            token_clone.cancel();
+        let command = descendant_command(pid_file.path());
+        let task = tokio::spawn({
+            let token = token.clone();
+            async move {
+                tool.shell_with_cwd(
+                    ShellParams {
+                        command,
+                        timeout_secs: None,
+                    },
+                    None,
+                    None,
+                    token,
+                )
+                .await
+            }
         });
 
-        let start = std::time::Instant::now();
-        let result = tool
-            .shell_with_cwd(
-                ShellParams {
-                    command: "sleep 30".to_string(),
-                    timeout_secs: None,
-                },
-                None,
-                None,
-                token,
-            )
-            .await;
+        let (shell_pid, descendant_pid) = wait_for_pids(pid_file.path()).await;
+        assert_eq!(
+            unsafe { libc::getpgid(shell_pid) },
+            shell_pid,
+            "the spawned shell must lead its dedicated process group"
+        );
+        assert_ne!(
+            unsafe { libc::getpgid(shell_pid) },
+            unsafe { libc::getpgrp() },
+            "the shell process group must not be Goose's process group"
+        );
 
-        assert!(
-            start.elapsed().as_secs() < 5,
-            "shell should return quickly after cancellation, not wait for the command"
-        );
-        let shell_output = extract_shell_output(&result);
-        assert!(
-            shell_output.exit_code.is_none(),
-            "cancelled process should have no exit code"
-        );
+        token.cancel();
+        let result = assert_task_completes(task).await;
+
+        assert!(extract_shell_output(&result).exit_code.is_none());
+        assert_pid_exits(descendant_pid).await;
     }
 
     #[cfg(not(windows))]
@@ -1316,15 +1478,17 @@ mod tests {
         assert_eq!(slots, expected);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[tokio::test]
-    async fn shell_does_not_hang_on_backgrounded_process() {
-        struct KillOnDrop(String);
-        impl Drop for KillOnDrop {
+    async fn shell_does_not_hang_or_kill_backgrounded_process() {
+        if is_flatpak() {
+            return;
+        }
+
+        struct KillProcessGroupOnDrop(libc::pid_t);
+        impl Drop for KillProcessGroupOnDrop {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &self.0])
-                    .status();
+                unsafe { libc::kill(-self.0, libc::SIGKILL) };
             }
         }
 
@@ -1332,7 +1496,7 @@ mod tests {
         let start = std::time::Instant::now();
         let result = tool
             .shell(ShellParams {
-                command: "echo before && sleep 300 & echo bgpid:$! && echo after".to_string(),
+                command: "echo before && sleep 300 & echo bgpid:$! pgid:$(ps -o pgid= -p $!) && echo after".to_string(),
                 timeout_secs: None,
             })
             .await;
@@ -1344,12 +1508,26 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
         let text = extract_text(&result);
         let shell_output = extract_shell_output(&result);
-        let background_pid = text
+        let (background_pid, process_group) = text
             .lines()
             .find_map(|line| line.strip_prefix("bgpid:"))
-            .map(str::trim)
-            .expect("expected bgpid in output");
-        let _cleanup = KillOnDrop(background_pid.to_string());
+            .and_then(|line| line.split_once(" pgid:"))
+            .expect("expected background pid and process group in output");
+        let background_pid = background_pid
+            .trim()
+            .parse()
+            .expect("background pid should be numeric");
+        let _cleanup = KillProcessGroupOnDrop(
+            process_group
+                .trim()
+                .parse()
+                .expect("background process group should be numeric"),
+        );
+        assert_eq!(
+            unsafe { libc::kill(background_pid, 0) },
+            0,
+            "normal completion must not kill background descendants"
+        );
         assert!(
             shell_output.output_truncated,
             "backgrounded process should set output_truncated"
@@ -1380,29 +1558,32 @@ mod tests {
         assert!(resolve_shell_timeout(None) > 0);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[tokio::test]
-    async fn shell_kills_hanging_command_after_explicit_timeout() {
+    async fn shell_timeout_kills_descendants() {
+        if is_flatpak() {
+            return;
+        }
+
+        let pid_file = tempfile::NamedTempFile::new().unwrap();
         let tool = ShellTool::new_for_test().unwrap();
-        let start = std::time::Instant::now();
-        let result = tool
-            .shell(ShellParams {
-                command: "sleep 30".to_string(),
+        let command = descendant_command(pid_file.path());
+        let task = tokio::spawn(async move {
+            tool.shell(ShellParams {
+                command,
                 timeout_secs: Some(1),
             })
-            .await;
+            .await
+        });
 
-        assert!(
-            start.elapsed().as_secs() < 10,
-            "shell should return shortly after the timeout, not wait for the command"
-        );
+        let (_, descendant_pid) = wait_for_pids(pid_file.path()).await;
+        let result = assert_task_completes(task).await;
+
         assert_eq!(result.is_error, Some(true));
         let shell_output = extract_shell_output(&result);
         assert!(shell_output.timed_out, "command should be marked timed_out");
-        assert!(
-            shell_output.exit_code.is_none(),
-            "killed process should have no exit code"
-        );
+        assert!(shell_output.exit_code.is_none());
         assert!(extract_text(&result).contains("Command timed out after 1 seconds"));
+        assert_pid_exits(descendant_pid).await;
     }
 }
