@@ -250,11 +250,21 @@ pub fn map_http_error_to_provider_error(
         payload
             .as_ref()
             .and_then(|p| {
-                p.get("error")
-                    .and_then(|e| e.get("message"))
-                    .or_else(|| p.get("message"))
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
+                let err_obj = p.get("error").unwrap_or(p);
+                let base_msg = err_obj
+                    .get("message")
+                    .and_then(|e| e.as_str())
+                    .or_else(|| p.get("message").and_then(|m| m.as_str()));
+
+                if let Some(msg) = base_msg {
+                    if let Some(details) = err_obj.get("details").or_else(|| p.get("details")) {
+                        if !details.is_null() && (!details.is_array() || !details.as_array().unwrap().is_empty()) {
+                            return Some(format!("{msg} Details: {details}"));
+                        }
+                    }
+                    return Some(msg.to_string());
+                }
+                None
             })
             .unwrap_or_else(|| payload.as_ref().map(|p| p.to_string()).unwrap_or_default())
     };
