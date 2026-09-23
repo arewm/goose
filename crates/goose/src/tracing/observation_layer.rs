@@ -2,8 +2,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tracing::field::{Field, Visit};
 use tracing::{span, Event, Id, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -101,26 +100,44 @@ pub struct ObservationLayer {
 }
 
 impl ObservationLayer {
-    pub async fn handle_span(&self, span_id: u64, span_data: SpanData) {
+    pub fn handle_span(&self, span_id: u64, span_data: SpanData) {
         let observation_id = span_data.observation_id.clone();
 
-        {
-            let mut spans = self.span_tracker.lock().await;
+        // Consolidate span addition, parent lookup, and trace id resolution into a single lock acquisition
+        let (parent_id, trace_id, need_trace_create) = {
+            let mut spans = self.span_tracker.lock().unwrap_or_else(|e| e.into_inner());
             spans.add_span(span_id, observation_id.clone());
-        }
 
-        // Get parent ID if it exists
-        let parent_id = if let Some(parent_span_id) = span_data.parent_span_id {
-            let spans = self.span_tracker.lock().await;
-            spans.get_span(parent_span_id).cloned()
-        } else {
-            None
+            let parent_id = span_data
+                .parent_span_id
+                .and_then(|parent_span_id| spans.get_span(parent_span_id).cloned());
+
+            if let Some(id) = spans.current_trace_id.clone() {
+                (parent_id, id, false)
+            } else {
+                let id = Uuid::new_v4().to_string();
+                spans.current_trace_id = Some(id.clone());
+                (parent_id, id, true)
+            }
         };
 
-        let trace_id = self.ensure_trace_id().await;
+        let mut batch = self.batch_manager.lock().unwrap_or_else(|e| e.into_inner());
+        if need_trace_create {
+            batch.add_event(
+                "trace-create",
+                json!({
+                    "id": trace_id,
+                    "name": Utc::now().timestamp().to_string(),
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "input": {},
+                    "metadata": {},
+                    "tags": [],
+                    "public": false
+                }),
+            );
+        }
 
         // Create the span observation
-        let mut batch = self.batch_manager.lock().await;
         batch.add_event(
             "observation-create",
             json!({
@@ -136,15 +153,15 @@ impl ObservationLayer {
         );
     }
 
-    pub async fn handle_span_close(&self, span_id: u64) {
+    pub fn handle_span_close(&self, span_id: u64) {
         let observation_id = {
-            let mut spans = self.span_tracker.lock().await;
+            let mut spans = self.span_tracker.lock().unwrap_or_else(|e| e.into_inner());
             spans.remove_span(span_id)
         };
 
         if let Some(observation_id) = observation_id {
-            let trace_id = self.ensure_trace_id().await;
-            let mut batch = self.batch_manager.lock().await;
+            let trace_id = self.ensure_trace_id();
+            let mut batch = self.batch_manager.lock().unwrap_or_else(|e| e.into_inner());
             batch.add_event(
                 "observation-update",
                 json!({
@@ -157,43 +174,48 @@ impl ObservationLayer {
         }
     }
 
-    pub async fn ensure_trace_id(&self) -> String {
-        let mut spans = self.span_tracker.lock().await;
-        if let Some(id) = spans.current_trace_id.clone() {
-            return id;
+    pub fn ensure_trace_id(&self) -> String {
+        let (trace_id, need_trace_create) = {
+            let mut spans = self.span_tracker.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(id) = spans.current_trace_id.clone() {
+                (id, false)
+            } else {
+                let id = Uuid::new_v4().to_string();
+                spans.current_trace_id = Some(id.clone());
+                (id, true)
+            }
+        };
+
+        if need_trace_create {
+            let mut batch = self.batch_manager.lock().unwrap_or_else(|e| e.into_inner());
+            batch.add_event(
+                "trace-create",
+                json!({
+                    "id": trace_id,
+                    "name": Utc::now().timestamp().to_string(),
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "input": {},
+                    "metadata": {},
+                    "tags": [],
+                    "public": false
+                }),
+            );
         }
-
-        let trace_id = Uuid::new_v4().to_string();
-        spans.current_trace_id = Some(trace_id.clone());
-
-        let mut batch = self.batch_manager.lock().await;
-        batch.add_event(
-            "trace-create",
-            json!({
-                "id": trace_id,
-                "name": Utc::now().timestamp().to_string(),
-                "timestamp": Utc::now().to_rfc3339(),
-                "input": {},
-                "metadata": {},
-                "tags": [],
-                "public": false
-            }),
-        );
 
         trace_id
     }
 
-    pub async fn update_trace(&self, updates: serde_json::Map<String, Value>) {
-        let trace_id = self.ensure_trace_id().await;
+    pub fn update_trace(&self, updates: serde_json::Map<String, Value>) {
+        let trace_id = self.ensure_trace_id();
         let mut body = json!({ "id": trace_id });
         for (k, v) in updates {
             body[k] = v;
         }
-        let mut batch = self.batch_manager.lock().await;
+        let mut batch = self.batch_manager.lock().unwrap_or_else(|e| e.into_inner());
         batch.add_event("trace-create", body);
     }
 
-    pub async fn handle_record(&self, span_id: u64, metadata: serde_json::Map<String, Value>) {
+    pub fn handle_record(&self, span_id: u64, metadata: serde_json::Map<String, Value>) {
         // Handle trace-level fields by updating the trace itself
         let trace_fields: Vec<&str> = vec!["trace_input", "trace_output"];
         let has_trace_fields = trace_fields.iter().any(|f| metadata.contains_key(*f));
@@ -207,7 +229,7 @@ impl ObservationLayer {
                 trace_updates.insert("output".to_string(), val.clone());
             }
             if !trace_updates.is_empty() {
-                self.update_trace(trace_updates).await;
+                self.update_trace(trace_updates);
             }
         }
 
@@ -222,12 +244,12 @@ impl ObservationLayer {
         }
 
         let observation_id = {
-            let spans = self.span_tracker.lock().await;
+            let spans = self.span_tracker.lock().unwrap_or_else(|e| e.into_inner());
             spans.get_span(span_id).cloned()
         };
 
         if let Some(observation_id) = observation_id {
-            let trace_id = self.ensure_trace_id().await;
+            let trace_id = self.ensure_trace_id();
 
             let mut update = json!({
                 "id": observation_id,
@@ -268,7 +290,7 @@ impl ObservationLayer {
                 }
             }
 
-            let mut batch = self.batch_manager.lock().await;
+            let mut batch = self.batch_manager.lock().unwrap_or_else(|e| e.into_inner());
             batch.add_event("span-update", update);
         }
     }
@@ -302,14 +324,12 @@ where
             parent_span_id,
         };
 
-        let layer = self.clone();
-        tokio::spawn(async move { layer.handle_span(span_id, span_data).await });
+        self.handle_span(span_id, span_data);
     }
 
     fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
         let span_id = id.into_u64();
-        let layer = self.clone();
-        tokio::spawn(async move { layer.handle_span_close(span_id).await });
+        self.handle_span_close(span_id);
     }
 
     fn on_record(&self, span: &Id, values: &span::Record<'_>, _ctx: Context<'_, S>) {
@@ -319,8 +339,7 @@ where
         let metadata = visitor.recorded_fields;
 
         if !metadata.is_empty() {
-            let layer = self.clone();
-            tokio::spawn(async move { layer.handle_record(span_id, metadata).await });
+            self.handle_record(span_id, metadata);
         }
     }
 
@@ -330,8 +349,7 @@ where
         let metadata = visitor.recorded_fields;
 
         if let Some(span_id) = ctx.lookup_current().map(|span| span.id().into_u64()) {
-            let layer = self.clone();
-            tokio::spawn(async move { layer.handle_record(span_id, metadata).await });
+            self.handle_record(span_id, metadata);
         }
     }
 }
@@ -375,9 +393,8 @@ impl Visit for JsonVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-    use tokio::sync::mpsc;
     use tracing::dispatcher;
+    use tracing_subscriber::layer::SubscriberExt;
 
     type Events = Arc<Mutex<Vec<(String, Value)>>>;
     struct TestFixture {
@@ -406,12 +423,12 @@ mod tests {
             (self, layer)
         }
 
-        async fn get_events(&self) -> Vec<(String, Value)> {
+        fn get_events(&self) -> Vec<(String, Value)> {
             self.events
                 .as_ref()
                 .expect("Events not initialized")
                 .lock()
-                .await
+                .unwrap_or_else(|e| e.into_inner())
                 .clone()
         }
     }
@@ -426,29 +443,20 @@ mod tests {
 
     struct MockBatchManager {
         events: Arc<Mutex<Vec<(String, Value)>>>,
-        sender: mpsc::UnboundedSender<(String, Value)>,
     }
 
     impl MockBatchManager {
         fn new(events: Arc<Mutex<Vec<(String, Value)>>>) -> Self {
-            let (sender, mut receiver) = mpsc::unbounded_channel();
-            let events_clone = events.clone();
-
-            tokio::spawn(async move {
-                while let Some((event_type, body)) = receiver.recv().await {
-                    events_clone.lock().await.push((event_type, body));
-                }
-            });
-
-            Self { events, sender }
+            Self { events }
         }
     }
 
     impl BatchManager for MockBatchManager {
         fn add_event(&mut self, event_type: &str, body: Value) {
-            self.sender
-                .send((event_type.to_string(), body))
-                .expect("Failed to send event");
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((event_type.to_string(), body));
         }
 
         fn send(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -456,7 +464,10 @@ mod tests {
         }
 
         fn is_empty(&self) -> bool {
-            futures::executor::block_on(async { self.events.lock().await.is_empty() })
+            self.events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
         }
     }
 
@@ -471,18 +482,15 @@ mod tests {
         }
     }
 
-    const TEST_WAIT_DURATION: Duration = Duration::from_secs(6);
-
-    #[tokio::test]
-    async fn test_span_creation() {
+    #[test]
+    fn test_span_creation() {
         let (fixture, layer) = TestFixture::new().with_test_layer();
         let span_id = 1u64;
         let span_data = create_test_span_data();
 
-        layer.handle_span(span_id, span_data.clone()).await;
-        tokio::time::sleep(TEST_WAIT_DURATION).await;
+        layer.handle_span(span_id, span_data.clone());
 
-        let events = fixture.get_events().await;
+        let events = fixture.get_events();
         assert_eq!(events.len(), 2); // trace-create and observation-create
 
         let (event_type, body) = &events[1];
@@ -492,17 +500,16 @@ mod tests {
         assert_eq!(body["type"], "SPAN");
     }
 
-    #[tokio::test]
-    async fn test_span_close() {
+    #[test]
+    fn test_span_close() {
         let (fixture, layer) = TestFixture::new().with_test_layer();
         let span_id = 1u64;
         let span_data = create_test_span_data();
 
-        layer.handle_span(span_id, span_data.clone()).await;
-        layer.handle_span_close(span_id).await;
-        tokio::time::sleep(TEST_WAIT_DURATION).await;
+        layer.handle_span(span_id, span_data.clone());
+        layer.handle_span_close(span_id);
 
-        let events = fixture.get_events().await;
+        let events = fixture.get_events();
         assert_eq!(events.len(), 3); // trace-create, observation-create, observation-update
 
         let (event_type, body) = &events[2];
@@ -511,23 +518,22 @@ mod tests {
         assert!(body["endTime"].as_str().is_some());
     }
 
-    #[tokio::test]
-    async fn test_record_handling() {
+    #[test]
+    fn test_record_handling() {
         let (fixture, layer) = TestFixture::new().with_test_layer();
         let span_id = 1u64;
         let span_data = create_test_span_data();
 
-        layer.handle_span(span_id, span_data.clone()).await;
+        layer.handle_span(span_id, span_data.clone());
 
         let mut metadata = serde_json::Map::new();
         metadata.insert("input".to_string(), json!("test input"));
         metadata.insert("output".to_string(), json!("test output"));
         metadata.insert("custom_field".to_string(), json!("custom value"));
 
-        layer.handle_record(span_id, metadata).await;
-        tokio::time::sleep(TEST_WAIT_DURATION).await;
+        layer.handle_record(span_id, metadata);
 
-        let events = fixture.get_events().await;
+        let events = fixture.get_events();
         assert_eq!(events.len(), 3); // trace-create, observation-create, span-update
 
         let (event_type, body) = &events[2];
@@ -537,22 +543,21 @@ mod tests {
         assert_eq!(body["metadata"]["custom_field"], "custom value");
     }
 
-    #[tokio::test]
-    async fn test_trace_input_output_updates() {
+    #[test]
+    fn test_trace_input_output_updates() {
         let (fixture, layer) = TestFixture::new().with_test_layer();
         let span_id = 1u64;
         let span_data = create_test_span_data();
 
-        layer.handle_span(span_id, span_data).await;
+        layer.handle_span(span_id, span_data.clone());
 
         let mut metadata = serde_json::Map::new();
         metadata.insert("trace_input".to_string(), json!("hello from user"));
         metadata.insert("trace_output".to_string(), json!("response from assistant"));
 
-        layer.handle_record(span_id, metadata).await;
-        tokio::time::sleep(TEST_WAIT_DURATION).await;
+        layer.handle_record(span_id, metadata);
 
-        let events = fixture.get_events().await;
+        let events = fixture.get_events();
         // trace-create, observation-create, trace-create (update with input/output)
         assert!(events.len() >= 3);
 
@@ -564,22 +569,21 @@ mod tests {
         assert_eq!(trace_update.1["output"], "response from assistant");
     }
 
-    #[tokio::test]
-    async fn test_trace_fields_not_sent_as_span_metadata() {
+    #[test]
+    fn test_trace_fields_not_sent_as_span_metadata() {
         let (fixture, layer) = TestFixture::new().with_test_layer();
         let span_id = 1u64;
         let span_data = create_test_span_data();
 
-        layer.handle_span(span_id, span_data).await;
+        layer.handle_span(span_id, span_data.clone());
 
         // Only trace-level fields, no span-level fields
         let mut metadata = serde_json::Map::new();
         metadata.insert("trace_input".to_string(), json!("user msg"));
 
-        layer.handle_record(span_id, metadata).await;
-        tokio::time::sleep(TEST_WAIT_DURATION).await;
+        layer.handle_record(span_id, metadata);
 
-        let events = fixture.get_events().await;
+        let events = fixture.get_events();
         // Should NOT have a span-update since there are no span-level fields
         let span_updates: Vec<_> = events.iter().filter(|(t, _)| t == "span-update").collect();
         assert!(
@@ -588,23 +592,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_mixed_trace_and_span_fields() {
+    #[test]
+    fn test_mixed_trace_and_span_fields() {
         let (fixture, layer) = TestFixture::new().with_test_layer();
         let span_id = 1u64;
         let span_data = create_test_span_data();
 
-        layer.handle_span(span_id, span_data).await;
+        layer.handle_span(span_id, span_data.clone());
 
         let mut metadata = serde_json::Map::new();
         metadata.insert("trace_input".to_string(), json!("user msg"));
         metadata.insert("input".to_string(), json!("tool input"));
         metadata.insert("output".to_string(), json!("tool output"));
 
-        layer.handle_record(span_id, metadata).await;
-        tokio::time::sleep(TEST_WAIT_DURATION).await;
+        layer.handle_record(span_id, metadata);
 
-        let events = fixture.get_events().await;
+        let events = fixture.get_events();
 
         // Should have both a trace update and a span-update
         let trace_updates: Vec<_> = events
@@ -635,5 +638,51 @@ mod tests {
         let flattened = flatten_metadata(metadata);
         assert_eq!(flattened["simple"], "value");
         assert_eq!(flattened["complex"], "inner value");
+    }
+
+    /// Verifies that ObservationLayer tracing hooks executed on non-Tokio worker threads
+    /// (e.g. sqlx-sqlite worker threads, rayon threads, std::threads) do not panic or crash.
+    #[test]
+    fn test_non_tokio_thread_span_lifecycle() {
+        let (fixture, layer) = TestFixture::new().with_test_layer();
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+
+        // Run tracing on a plain std::thread with no Tokio reactor running
+        let handle = std::thread::spawn(move || {
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!(
+                    target: "goose::test",
+                    "worker_thread_span",
+                    input = "thread_input"
+                );
+                let _enter = span.enter();
+                tracing::info!(target: "goose::test", "event_on_worker_thread");
+                drop(_enter);
+                drop(span);
+            });
+        });
+
+        assert!(
+            handle.join().is_ok(),
+            "Thread panicked during span lifecycle"
+        );
+
+        let events = fixture.get_events();
+        assert!(
+            !events.is_empty(),
+            "Events should be recorded from plain std::thread"
+        );
+        let has_span = events
+            .iter()
+            .any(|(t, b)| t == "observation-create" && b["name"] == "worker_thread_span");
+        assert!(
+            has_span,
+            "observation-create for worker_thread_span should be recorded"
+        );
+        let has_close = events.iter().any(|(t, _)| t == "observation-update");
+        assert!(
+            has_close,
+            "observation-update for span close should be recorded"
+        );
     }
 }
