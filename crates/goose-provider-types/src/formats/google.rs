@@ -37,14 +37,6 @@ pub fn get_thought_signature(metadata: &Option<ProviderMetadata>) -> Option<&str
         .and_then(|v| v.as_str())
 }
 
-fn is_user_loop_boundary(message: &Message) -> bool {
-    message.role == Role::User
-        && message
-            .content
-            .iter()
-            .any(|content| !matches!(content, MessageContentBlock::ToolResponse(_)))
-}
-
 fn insert_thought_signature(part: &mut Map<String, Value>, signature: &str) {
     part.insert(THOUGHT_SIGNATURE_KEY.to_string(), json!(signature));
 }
@@ -92,46 +84,47 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
         })
         .collect();
 
-    // Record names as we walk the conversation so a reused tool-call id
-    // resolves to the nearest preceding request, not a later overwrite.
-    let mut tool_names: HashMap<&str, String> = HashMap::new();
-
-    let active_loop_start_idx = filtered
+    let fallback_tool_names: HashMap<_, _> = filtered
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, m)| is_user_loop_boundary(m))
-        .map(|(i, _)| i);
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            MessageContentBlock::ToolRequest(request) => request
+                .tool_call
+                .as_ref()
+                .ok()
+                .map(|tool_call| (request.id.as_str(), sanitize_function_name(&tool_call.name))),
+            _ => None,
+        })
+        .collect();
 
-    filtered
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, message)| {
-            let role = if message.role == Role::User {
-                "user"
-            } else {
-                "model"
-            };
-            let include_signature = active_loop_start_idx.is_none_or(|start_idx| idx >= start_idx);
-            // Only the first model tool call in a turn is guaranteed to carry
-            // a signature for loop continuity.
-            let mut needs_synthetic_for_first_model_tool_call =
-                include_signature && message.role != Role::User;
-            let mut parts = Vec::new();
-            for message_content in message.content.iter() {
-                match message_content {
-                    MessageContentBlock::Text(text) => {
-                        if !text.text.is_empty() {
-                            parts.push(json!({"text": text.text}));
-                        }
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+
+    let mut raw_contents: Vec<Value> = Vec::new();
+    for message in &filtered {
+        let role = if message.role == Role::User {
+            "user"
+        } else {
+            "model"
+        };
+        let mut parts = Vec::new();
+        for message_content in message.content.iter() {
+            match message_content {
+                MessageContentBlock::Text(text) => {
+                    if !text.text.is_empty() {
+                        parts.push(json!({"text": text.text}));
                     }
-                    MessageContentBlock::ToolRequest(request) => match &request.tool_call {
-                        Ok(tool_call) => {
-                            let name = sanitize_function_name(&tool_call.name);
-                            tool_names.insert(request.id.as_str(), name.clone());
-                            let mut function_call_part = Map::new();
-                            function_call_part.insert("id".to_string(), json!(request.id));
-                            function_call_part.insert("name".to_string(), json!(name));
+                }
+                MessageContentBlock::ToolRequest(request) => match &request.tool_call {
+                    Ok(tool_call) => {
+                        let fn_name = sanitize_function_name(&tool_call.name);
+                        tool_names.insert(request.id.clone(), fn_name.clone());
+
+                        let mut function_call_part = Map::new();
+                        function_call_part.insert("id".to_string(), json!(request.id));
+                        function_call_part.insert(
+                            "name".to_string(),
+                            json!(fn_name),
+                        );
 
                             if let Some(args) = &tool_call.arguments {
                                 if !args.is_empty() {
@@ -143,17 +136,14 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                             let mut part = Map::new();
                             part.insert("functionCall".to_string(), json!(function_call_part));
 
-                            if include_signature {
-                                if let Some(signature) = get_thought_signature(&request.metadata) {
-                                    insert_thought_signature(&mut part, signature);
-                                } else if needs_synthetic_for_first_model_tool_call {
-                                    insert_thought_signature(
-                                        &mut part,
-                                        SYNTHETIC_THOUGHT_SIGNATURE,
-                                    );
-                                }
+                            if let Some(signature) = get_thought_signature(&request.metadata) {
+                                insert_thought_signature(&mut part, signature);
+                            } else {
+                                insert_thought_signature(
+                                    &mut part,
+                                    SYNTHETIC_THOUGHT_SIGNATURE,
+                                );
                             }
-                            needs_synthetic_for_first_model_tool_call = false;
 
                             parts.push(json!(part));
                         }
@@ -215,18 +205,18 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                             let name = tool_names
                                 .get(response.id.as_str())
                                 .map(String::as_str)
+                                .or_else(|| fallback_tool_names.get(response.id.as_str()).map(String::as_str))
                                 .unwrap_or(response.id.as_str());
                             let mut part =
                                 build_function_response_part(&response.id, name, text, media);
-                            if include_signature {
-                                maybe_insert_signature_from_metadata(&mut part, &response.metadata);
-                            }
+                            maybe_insert_signature_from_metadata(&mut part, &response.metadata);
                             parts.push(json!(part));
                         }
                         Err(e) => {
                             let name = tool_names
                                 .get(response.id.as_str())
                                 .map(String::as_str)
+                                .or_else(|| fallback_tool_names.get(response.id.as_str()).map(String::as_str))
                                 .unwrap_or(response.id.as_str());
                             let mut part = build_function_response_part(
                                 &response.id,
@@ -234,9 +224,7 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                                 format!("Error: {}", e),
                                 Vec::new(),
                             );
-                            if include_signature {
-                                maybe_insert_signature_from_metadata(&mut part, &response.metadata);
-                            }
+                            maybe_insert_signature_from_metadata(&mut part, &response.metadata);
                             parts.push(json!(part));
                         }
                     },
@@ -267,13 +255,64 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                     _ => {}
                 }
             }
-            if parts.is_empty() {
-                None
-            } else {
-                Some(json!({"role": role, "parts": parts}))
+            if !parts.is_empty() {
+                raw_contents.push(json!({"role": role, "parts": parts}));
             }
-        })
-        .collect()
+        }
+
+    let mut coalesced: Vec<Value> = Vec::new();
+    for mut item in raw_contents {
+        let Some(role) = item
+            .get("role")
+            .and_then(|r| r.as_str())
+            .map(|s| s.to_string())
+        else {
+            continue;
+        };
+        let Some(parts) = item
+            .get_mut("parts")
+            .and_then(|p| p.as_array_mut())
+            .map(std::mem::take)
+        else {
+            continue;
+        };
+
+        if let Some(last) = coalesced.last_mut() {
+            if last.get("role").and_then(|r| r.as_str()) == Some(&role) {
+                if role == "user" {
+                    let last_has_fn_response = last
+                        .get("parts")
+                        .and_then(|p| p.as_array())
+                        .map(|arr| arr.iter().any(|part| part.get("functionResponse").is_some()))
+                        .unwrap_or(false);
+                    let item_has_fn_response =
+                        parts.iter().any(|part| part.get("functionResponse").is_some());
+
+                    if last_has_fn_response != item_has_fn_response {
+                        // Google Gemini forbids mixing `functionResponse` and regular text
+                        // in the same user turn. If a tool-response turn is immediately followed
+                        // by user text (or vice versa), Gemini also forbids consecutive user turns.
+                        // Insert an intermediate model turn to bridge them and preserve strict alternation.
+                        coalesced.push(json!({
+                            "role": "model",
+                            "parts": [{"text": "I have received the tool output."}]
+                        }));
+                        coalesced.push(json!({"role": role, "parts": parts}));
+                        continue;
+                    }
+                }
+
+                if let Some(last_parts) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                    last_parts.extend(parts);
+                    continue;
+                }
+            }
+        }
+
+        coalesced.push(json!({"role": role, "parts": parts}));
+    }
+
+    coalesced
 }
 
 pub fn format_tools(tools: &[Tool]) -> Vec<Value> {
@@ -380,27 +419,68 @@ pub fn response_to_message(response: Value) -> Result<Message> {
     let role = Role::Assistant;
     let created = chrono::Utc::now().timestamp();
 
-    let parts = response
+    let candidate = response
         .get("candidates")
         .and_then(|v| v.as_array())
-        .and_then(|c| c.first())
+        .and_then(|c| c.first());
+
+    let finish_reason = candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(|v| v.as_str());
+
+    if let Some(reason) = finish_reason {
+        if matches!(
+            reason,
+            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
+        ) {
+            return Err(ProviderError::Refusal {
+                details: format!(
+                    "Google Gemini blocked the response due to finish reason: {reason}"
+                ),
+                category: Some(reason.to_string()),
+            }
+            .into());
+        }
+    }
+
+    let parts = candidate
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array());
 
-    let Some(parts) = parts else {
-        return Ok(Message::new(role, created, Vec::new()));
-    };
-
     let mut content = Vec::new();
     let mut last_signature: Option<String> = None;
+    let mut has_tool_call = false;
 
-    for part in parts {
-        if let Some(msg_content) = process_response_part_impl(part, &mut last_signature) {
-            content.push(msg_content);
+    if let Some(parts) = parts {
+        for part in parts {
+            if part.get("functionCall").is_some() {
+                has_tool_call = true;
+            }
+            if let Some(msg_content) = process_response_part_impl(part, &mut last_signature) {
+                content.push(msg_content);
+            }
         }
     }
-    Ok(Message::new(role, created, content))
+
+    if finish_reason == Some("MALFORMED_FUNCTION_CALL") && !has_tool_call {
+        let error = ErrorData::new(
+            ErrorCode::INVALID_REQUEST,
+            "The model attempted to call a function, but the call was malformed or could not be parsed by Google Gemini. Please retry the function call with valid arguments.".to_string(),
+            None,
+        );
+        content.push(MessageContentBlock::tool_request(
+            Uuid::new_v4().to_string(),
+            Err(error),
+        ));
+    }
+
+    let mut message = Message::new(role, created, content);
+    if finish_reason == Some("MAX_TOKENS") {
+        message.metadata.output_token_limit_reached = true;
+    }
+
+    Ok(message)
 }
 
 /// Extract usage information from Google's API response
@@ -467,6 +547,7 @@ where
         let mut incomplete_data: Option<String> = None;
         let mut last_finish_reason: Option<String> = None;
         let mut last_response_id: Option<String> = None;
+        let mut has_emitted_tool_call = false;
 
         while let Some(line_result) = stream.next().await {
             let line = line_result?;
@@ -565,6 +646,9 @@ where
 
             if let Some(parts) = parts {
                 for part in parts {
+                    if part.get("functionCall").is_some() {
+                        has_emitted_tool_call = true;
+                    }
                     if let Some(content) = process_response_part_impl(part, &mut last_signature) {
                         let message = Message::new(
                             Role::Assistant,
@@ -577,12 +661,49 @@ where
             }
         }
 
+        if last_finish_reason.as_deref() == Some("MALFORMED_FUNCTION_CALL") && !has_emitted_tool_call {
+            let error = ErrorData::new(
+                ErrorCode::INVALID_REQUEST,
+                "The model attempted to call a function, but the call was malformed or could not be parsed by Google Gemini. Please retry the function call with valid arguments.".to_string(),
+                None,
+            );
+            let message = Message::new(
+                Role::Assistant,
+                chrono::Utc::now().timestamp(),
+                vec![MessageContentBlock::tool_request(
+                    Uuid::new_v4().to_string(),
+                    Err(error),
+                )],
+            ).with_id(stream_id.clone());
+            yield (Some(message), None);
+        }
+
+        if last_finish_reason.as_deref() == Some("MAX_TOKENS") {
+            let mut message = Message::assistant().with_id(stream_id.clone());
+            message.metadata.output_token_limit_reached = true;
+            yield (Some(message), None);
+        }
+
         if let Some(mut usage) = final_usage {
-            if let Some(reason) = last_finish_reason {
+            if let Some(reason) = last_finish_reason.clone() {
                 usage.finish_reasons = Some(vec![reason]);
             }
             usage.response_id = last_response_id;
             yield (None, Some(usage));
+        }
+
+        if let Some(reason) = last_finish_reason {
+            if matches!(
+                reason.as_str(),
+                "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII"
+            ) {
+                Err(ProviderError::Refusal {
+                    details: format!(
+                        "Google Gemini blocked the response due to finish reason: {reason}"
+                    ),
+                    category: Some(reason),
+                })?;
+            }
         }
     }
 }
@@ -1885,5 +2006,444 @@ data: [DONE]"#;
         let payload = create_request(&config, "system", &[], &[]).unwrap();
 
         assert!(payload["generationConfig"].get("temperature").is_none());
+    }
+
+    #[test]
+    fn test_format_messages_coalesces_consecutive_user_messages() {
+        let prompt = set_up_text_message("User prompt", Role::User);
+        let turn_context = set_up_text_message("<turn-context>...</turn-context>", Role::User);
+        let summary1 = set_up_text_message("A call was made to git", Role::User);
+        let summary2 = set_up_text_message("A call was made to pytest", Role::User);
+
+        let messages = vec![prompt, turn_context, summary1, summary2];
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0]["role"], "user");
+        let parts = payload[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["text"], "User prompt");
+        assert_eq!(parts[1]["text"], "<turn-context>...</turn-context>");
+        assert_eq!(parts[2]["text"], "A call was made to git");
+        assert_eq!(parts[3]["text"], "A call was made to pytest");
+    }
+
+    #[test]
+    fn test_format_messages_coalesces_consecutive_model_messages() {
+        let model_msg1 = set_up_text_message("First thought", Role::Assistant);
+        let model_msg2 = set_up_text_message("Second thought", Role::Assistant);
+
+        let messages = vec![
+            set_up_text_message("Hello", Role::User),
+            model_msg1,
+            model_msg2,
+        ];
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0]["role"], "user");
+        assert_eq!(payload[1]["role"], "model");
+        let model_parts = payload[1]["parts"].as_array().unwrap();
+        assert_eq!(model_parts.len(), 2);
+        assert_eq!(model_parts[0]["text"], "First thought");
+        assert_eq!(model_parts[1]["text"], "Second thought");
+    }
+
+    #[test]
+    fn test_format_messages_coalescing_preserves_thought_signatures_and_tool_calls() {
+        const SIG: &str = "test_signature_xyz";
+        let user_prompt = set_up_text_message("Do work", Role::User);
+
+        let mut req1 = CallToolRequestParams::new("shell");
+        req1.arguments = Some(object!({"command": "ls"}));
+        let sig_meta = metadata_with_signature(SIG);
+        let model_tool1 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request_with_metadata(
+                "call_1".to_string(),
+                Ok(req1),
+                Some(&sig_meta),
+            )],
+        );
+
+        let mut req2 = CallToolRequestParams::new("edit");
+        req2.arguments = Some(object!({"path": "foo.txt"}));
+        let model_tool2 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request(
+                "call_2".to_string(),
+                Ok(req2),
+            )],
+        );
+
+        let messages = vec![user_prompt, model_tool1, model_tool2];
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0]["role"], "user");
+        assert_eq!(payload[1]["role"], "model");
+
+        let model_parts = payload[1]["parts"].as_array().unwrap();
+        assert_eq!(model_parts.len(), 2);
+        assert_eq!(model_parts[0]["functionCall"]["name"], "shell");
+        assert_eq!(model_parts[0][THOUGHT_SIGNATURE_KEY], SIG);
+        assert_eq!(model_parts[1]["functionCall"]["name"], "edit");
+    }
+
+    #[test]
+    fn test_format_messages_strictly_alternates_roles() {
+        let messages = vec![
+            set_up_text_message("user 1", Role::User),
+            set_up_text_message("user 2", Role::User),
+            set_up_text_message("assistant 1", Role::Assistant),
+            set_up_text_message("assistant 2", Role::Assistant),
+            set_up_text_message("assistant 3", Role::Assistant),
+            set_up_text_message("user 3", Role::User),
+            set_up_text_message("user 4", Role::User),
+            set_up_text_message("assistant 4", Role::Assistant),
+            set_up_text_message("user 5", Role::User),
+        ];
+
+        let payload = format_messages(&messages, false);
+
+        assert_eq!(payload.len(), 5);
+        let roles: Vec<&str> = payload
+            .iter()
+            .map(|item| item["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "model", "user", "model", "user"]);
+
+        // Verify no consecutive identical roles
+        for i in 0..payload.len() - 1 {
+            assert_ne!(
+                payload[i]["role"],
+                payload[i + 1]["role"],
+                "Adjacent turns at indices {} and {} both have role {}",
+                i,
+                i + 1,
+                payload[i]["role"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_response_to_message_with_malformed_function_call() {
+        let response = json!({
+            "candidates": [{
+                "finishReason": "MALFORMED_FUNCTION_CALL"
+            }]
+        });
+        let message = response_to_message(response).unwrap();
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.len(), 1);
+        let tool_req = message.content[0].as_tool_request().expect("Expected tool request");
+        match &tool_req.tool_call {
+            Err(err) => {
+                assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+                assert!(err.message.contains("malformed"));
+            }
+            Ok(_) => panic!("Expected tool call Err"),
+        }
+    }
+
+    #[test]
+    fn test_response_to_message_with_max_tokens() {
+        let response = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": "Partial text..."
+                    }]
+                },
+                "finishReason": "MAX_TOKENS"
+            }]
+        });
+        let message = response_to_message(response).unwrap();
+        assert!(message.metadata.output_token_limit_reached);
+        assert_eq!(message.content.len(), 1);
+    }
+
+    #[test]
+    fn test_response_to_message_with_safety_refusal() {
+        let response = json!({
+            "candidates": [{
+                "finishReason": "SAFETY"
+            }]
+        });
+        let err = response_to_message(response).unwrap_err();
+        match err.downcast_ref::<ProviderError>() {
+            Some(ProviderError::Refusal { details, category }) => {
+                assert!(details.contains("SAFETY"));
+                assert_eq!(category.as_deref(), Some("SAFETY"));
+            }
+            _ => panic!("Expected ProviderError::Refusal"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_malformed_function_call() {
+        use futures::StreamExt;
+
+        let sse = concat!(
+            r#"data: {"candidates": [{"finishReason": "MALFORMED_FUNCTION_CALL"}], "#,
+            r#""usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}}"#
+        );
+        let lines: Vec<Result<String, anyhow::Error>> =
+            sse.lines().map(|l| Ok(l.to_string())).collect();
+        let stream = Box::pin(futures::stream::iter(lines));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut emitted_tool_request = false;
+        while let Some(result) = message_stream.next().await {
+            let (message, _) = result.unwrap();
+            if let Some(msg) = message {
+                if let Some(tool_req) = msg.content.first().and_then(|c| c.as_tool_request()) {
+                    if let Err(err) = &tool_req.tool_call {
+                        assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
+                        assert!(err.message.contains("malformed"));
+                        emitted_tool_request = true;
+                    }
+                }
+            }
+        }
+        assert!(emitted_tool_request, "Expected synthetic tool request on MALFORMED_FUNCTION_CALL");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_max_tokens() {
+        use futures::StreamExt;
+
+        let sse = concat!(
+            r#"data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "Truncated"}]}}]}"#,
+            "\n",
+            r#"data: {"candidates": [{"finishReason": "MAX_TOKENS"}], "#,
+            r#""usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 4096, "totalTokenCount": 4106}}"#
+        );
+        let lines: Vec<Result<String, anyhow::Error>> =
+            sse.lines().map(|l| Ok(l.to_string())).collect();
+        let stream = Box::pin(futures::stream::iter(lines));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut token_limit_reached = false;
+        while let Some(result) = message_stream.next().await {
+            let (message, _) = result.unwrap();
+            if let Some(msg) = message {
+                if msg.metadata.output_token_limit_reached {
+                    token_limit_reached = true;
+                }
+            }
+        }
+        assert!(token_limit_reached, "Expected output_token_limit_reached metadata flag on MAX_TOKENS");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_safety_refusal() {
+        use futures::StreamExt;
+
+        let sse = r#"data: {"candidates": [{"finishReason": "SAFETY"}]}"#;
+        let lines: Vec<Result<String, anyhow::Error>> =
+            sse.lines().map(|l| Ok(l.to_string())).collect();
+        let stream = Box::pin(futures::stream::iter(lines));
+        let mut message_stream = std::pin::pin!(response_to_streaming_message(stream));
+
+        let mut received_refusal = false;
+        while let Some(result) = message_stream.next().await {
+            if let Err(err) = result {
+                if let Some(ProviderError::Refusal { details, category }) = err.downcast_ref::<ProviderError>() {
+                    assert!(details.contains("SAFETY"));
+                    assert_eq!(category.as_deref(), Some("SAFETY"));
+                    received_refusal = true;
+                }
+            }
+        }
+        assert!(received_refusal, "Expected Refusal error on SAFETY finishReason");
+    }
+
+    #[test]
+    fn test_format_messages_preserves_thought_signatures_across_historical_turns() {
+        const SIG1: &str = "signature_turn_1";
+        const SIG2: &str = "signature_turn_2";
+
+        let user1 = set_up_text_message("First user turn", Role::User);
+
+        let mut req1 = CallToolRequestParams::new("shell");
+        req1.arguments = Some(object!({"command": "pwd"}));
+        let sig1_meta = metadata_with_signature(SIG1);
+        let assistant1 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request_with_metadata(
+                "call_1".to_string(),
+                Ok(req1),
+                Some(&sig1_meta),
+            )],
+        );
+
+        let resp1 = set_up_tool_response_message("call_1", vec![ContentBlock::text("/home")]);
+
+        let user2 = set_up_text_message("Second user turn", Role::User);
+
+        let mut req2 = CallToolRequestParams::new("shell");
+        req2.arguments = Some(object!({"command": "ls"}));
+        let sig2_meta = metadata_with_signature(SIG2);
+        let assistant2 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request_with_metadata(
+                "call_2".to_string(),
+                Ok(req2),
+                Some(&sig2_meta),
+            )],
+        );
+
+        let resp2 = set_up_tool_response_message("call_2", vec![ContentBlock::text("file.txt")]);
+
+        let user3 = set_up_text_message("Third user turn", Role::User);
+
+        let messages = vec![user1, assistant1, resp1, user2, assistant2, resp2, user3];
+        let payload = format_messages(&messages, false);
+
+        // Turn 1 assistant tool call at index 1 must preserve SIG1
+        assert_eq!(payload[1]["role"], "model");
+        assert_eq!(
+            payload[1]["parts"][0]["thoughtSignature"],
+            SIG1,
+            "Historical function call must preserve its thought signature"
+        );
+
+        // Turn 2 assistant tool call at index 3 must still have SIG2
+        assert_eq!(payload[3]["role"], "model");
+        assert_eq!(
+            payload[3]["parts"][0]["thoughtSignature"],
+            SIG2,
+            "Recent function call must preserve its thought signature"
+        );
+    }
+
+    #[test]
+    fn test_format_messages_does_not_mix_function_response_and_user_text() {
+        let user1 = set_up_text_message("Do task", Role::User);
+
+        let mut req1 = CallToolRequestParams::new("shell");
+        req1.arguments = Some(object!({"command": "pwd"}));
+        let sig1_meta = metadata_with_signature("sig_pwd");
+        let assistant1 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request_with_metadata(
+                "call_1".to_string(),
+                Ok(req1),
+                Some(&sig1_meta),
+            )],
+        );
+
+        let resp1 = Message::new(
+            Role::User,
+            0,
+            vec![MessageContentBlock::tool_response(
+                "call_1".to_string(),
+                Ok(CallToolResult::success(vec![ContentBlock::text("/home")])),
+            )],
+        );
+        let user_resume_text = set_up_text_message("continue", Role::User);
+        let user_context = set_up_text_message("<turn-context>...</turn-context>", Role::User);
+
+        let messages = vec![user1, assistant1, resp1, user_resume_text, user_context];
+        let payload = format_messages(&messages, false);
+
+        // Turn 0: user "Do task"
+        assert_eq!(payload[0]["role"], "user");
+        assert!(payload[0]["parts"][0].get("text").is_some());
+
+        // Turn 1: model tool call "pwd"
+        assert_eq!(payload[1]["role"], "model");
+        assert!(payload[1]["parts"][0].get("functionCall").is_some());
+
+        // Turn 2: user tool response ONLY (must NOT mix with "continue")
+        assert_eq!(payload[2]["role"], "user");
+        assert_eq!(payload[2]["parts"].as_array().unwrap().len(), 1);
+        assert!(payload[2]["parts"][0].get("functionResponse").is_some());
+
+        // Turn 3: synthetic model acknowledgment bridging the tool response and user text
+        assert_eq!(payload[3]["role"], "model");
+        assert!(payload[3]["parts"][0].get("text").is_some());
+
+        // Turn 4: user "continue" + turn-context coalesced
+        assert_eq!(payload[4]["role"], "user");
+        assert_eq!(payload[4]["parts"].as_array().unwrap().len(), 2);
+        assert_eq!(payload[4]["parts"][0]["text"], "continue");
+        assert_eq!(payload[4]["parts"][1]["text"], "<turn-context>...</turn-context>");
+
+        // Verify strict alternation
+        for i in 0..payload.len() - 1 {
+            assert_ne!(payload[i]["role"], payload[i + 1]["role"]);
+        }
+    }
+
+    #[test]
+    fn test_format_messages_handles_reused_tool_call_ids_across_turns() {
+        let user1 = set_up_text_message("Run command", Role::User);
+
+        let mut req1 = CallToolRequestParams::new("shell");
+        req1.arguments = Some(object!({"command": "pwd"}));
+        let assistant1 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request(
+                "call_shared_id".to_string(),
+                Ok(req1),
+            )],
+        );
+
+        let resp1 = Message::new(
+            Role::User,
+            0,
+            vec![MessageContentBlock::tool_response(
+                "call_shared_id".to_string(),
+                Ok(CallToolResult::success(vec![ContentBlock::text("/home")])),
+            )],
+        );
+
+        // Later turn reuses the exact same call_shared_id for a different tool:
+        let mut req2 = CallToolRequestParams::new("todo__todo_write");
+        req2.arguments = Some(object!({"content": "- [x] Done"}));
+        let assistant2 = Message::new(
+            Role::Assistant,
+            0,
+            vec![MessageContentBlock::tool_request(
+                "call_shared_id".to_string(),
+                Ok(req2),
+            )],
+        );
+
+        let resp2 = Message::new(
+            Role::User,
+            0,
+            vec![MessageContentBlock::tool_response(
+                "call_shared_id".to_string(),
+                Ok(CallToolResult::success(vec![ContentBlock::text("Updated")])),
+            )],
+        );
+
+        let messages = vec![user1, assistant1, resp1, assistant2, resp2];
+        let payload = format_messages(&messages, false);
+
+        // Model turn 1
+        assert_eq!(payload[1]["role"], "model");
+        assert_eq!(payload[1]["parts"][0]["functionCall"]["name"], "shell");
+
+        // User turn 1 (functionResponse) MUST match "shell", NOT be overwritten by "todo__todo_write"
+        assert_eq!(payload[2]["role"], "user");
+        assert_eq!(payload[2]["parts"][0]["functionResponse"]["name"], "shell");
+
+        // Model turn 2
+        assert_eq!(payload[3]["role"], "model");
+        assert_eq!(payload[3]["parts"][0]["functionCall"]["name"], "todo__todo_write");
+
+        // User turn 2 (functionResponse) MUST match "todo__todo_write"
+        assert_eq!(payload[4]["role"], "user");
+        assert_eq!(payload[4]["parts"][0]["functionResponse"]["name"], "todo__todo_write");
     }
 }
