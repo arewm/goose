@@ -4,9 +4,8 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use url::Url;
 use uuid::Uuid;
 
@@ -58,35 +57,77 @@ impl LangfuseBatchManager {
     pub fn spawn_sender(manager: Arc<Mutex<Self>>) {
         const BATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-        tokio::spawn(async move {
+        let runner = async move {
             loop {
                 tokio::time::sleep(BATCH_INTERVAL).await;
-                if let Err(e) = manager.lock().await.send() {
-                    tracing::error!(
-                        error.msg = %e,
-                        error.type = %std::any::type_name_of_val(&e),
-                        "Failed to send batch to Langfuse"
-                    );
+                let to_send = {
+                    let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.batch.is_empty() {
+                        None
+                    } else {
+                        let batch = std::mem::take(&mut guard.batch);
+                        Some((
+                            guard.client.clone(),
+                            guard.base_url.clone(),
+                            guard.public_key.clone(),
+                            guard.secret_key.clone(),
+                            batch,
+                        ))
+                    }
+                };
+
+                if let Some((client, base_url, public_key, secret_key, batch)) = to_send {
+                    if let Err(e) =
+                        Self::send_batch_async(&client, &base_url, &public_key, &secret_key, batch)
+                            .await
+                    {
+                        tracing::error!(
+                            error.msg = %e,
+                            error.type = %std::any::type_name_of_val(&e),
+                            "Failed to send batch to Langfuse"
+                        );
+                    }
                 }
             }
-        });
+        };
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(runner);
+        } else {
+            std::thread::Builder::new()
+                .name("langfuse-sender".to_string())
+                .spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        rt.block_on(runner);
+                    }
+                })
+                .ok();
+        }
     }
 
-    pub async fn send_async(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.batch.is_empty() {
+    pub async fn send_batch_async(
+        client: &Client,
+        base_url: &str,
+        public_key: &str,
+        secret_key: &str,
+        batch: Vec<Value>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if batch.is_empty() {
             return Ok(());
         }
 
-        let payload = json!({ "batch": self.batch });
-        let base_url = Url::parse(&self.base_url).map_err(|e| format!("Invalid base URL: {e}"))?;
+        let payload = json!({ "batch": batch });
+        let base_url = Url::parse(base_url).map_err(|e| format!("Invalid base URL: {e}"))?;
         let url = base_url
             .join("api/public/ingestion")
             .map_err(|e| format!("Failed to construct endpoint URL: {e}"))?;
 
-        let response = self
-            .client
+        let response = client
             .post(url)
-            .basic_auth(&self.public_key, Some(&self.secret_key))
+            .basic_auth(public_key, Some(secret_key))
             .json(&payload)
             .send()
             .await?;
@@ -103,10 +144,6 @@ impl LangfuseBatchManager {
                         error = ?error.error,
                         "Partial failure in batch ingestion"
                     );
-                }
-
-                if !response_body.successes.is_empty() {
-                    self.batch.clear();
                 }
 
                 if response_body.successes.is_empty() && !response_body.errors.is_empty() {
@@ -129,6 +166,28 @@ impl LangfuseBatchManager {
             }
         }
     }
+
+    pub async fn send_async(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+
+        let batch = self.batch.clone();
+        let result = Self::send_batch_async(
+            &self.client,
+            &self.base_url,
+            &self.public_key,
+            &self.secret_key,
+            batch,
+        )
+        .await;
+
+        if result.is_ok() {
+            self.batch.clear();
+        }
+
+        result
+    }
 }
 
 impl BatchManager for LangfuseBatchManager {
@@ -142,9 +201,31 @@ impl BatchManager for LangfuseBatchManager {
     }
 
     fn send(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.send_async())
-        })
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(self.send_async()))
+                }
+                _ => std::thread::scope(|s| {
+                    s.spawn(|| {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        rt.block_on(self.send_async())
+                    })
+                    .join()
+                    .map_err(|_| {
+                        Box::new(std::io::Error::other("thread panicked during send"))
+                            as Box<dyn std::error::Error + Send + Sync>
+                    })?
+                }),
+            }
+        } else {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(self.send_async())
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -189,8 +270,9 @@ pub fn create_langfuse_observer() -> Option<ObservationLayer> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
     use std::collections::HashMap;
-    use tokio::sync::Mutex;
+    use std::sync::Mutex;
     use tracing::dispatcher;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -311,6 +393,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_batch_send_success() {
         let fixture = TestFixture::new().await.with_mock_server().await;
 
@@ -338,6 +421,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_batch_send_partial_failure() {
         let fixture = TestFixture::new().await.with_mock_server().await;
 
@@ -473,8 +557,9 @@ mod tests {
 
         // Verify the observer has an empty batch manager
         let batch_manager = observer.unwrap().batch_manager;
-        assert!(batch_manager.lock().await.is_empty());
+        assert!(batch_manager.lock().unwrap().is_empty());
     }
+
     #[tokio::test]
     async fn test_batch_manager_spawn_sender() {
         let fixture = TestFixture::new().await.with_mock_server().await;
@@ -497,13 +582,13 @@ mod tests {
 
         manager
             .lock()
-            .await
+            .unwrap()
             .add_event("test-event", create_test_event());
 
         // Instead of spawning the sender which uses blocking operations,
         // test the async send directly
-        let result = manager.lock().await.send_async().await;
+        let result = manager.lock().unwrap().send_async().await;
         assert!(result.is_ok());
-        assert!(manager.lock().await.batch.is_empty());
+        assert!(manager.lock().unwrap().batch.is_empty());
     }
 }
