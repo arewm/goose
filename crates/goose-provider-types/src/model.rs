@@ -357,6 +357,11 @@ impl ModelConfig {
             return tokens;
         }
 
+        let lower = self.model_name.to_lowercase();
+        if lower.contains("gemini-2.5") || Self::is_gemini3_reasoning_model_name(&self.model_name) {
+            return 65_536;
+        }
+
         4_096
     }
 
@@ -1058,6 +1063,42 @@ mod tests {
             let mut config = ModelConfig::new("claude-sonnet-4");
             config.reasoning = Some(false);
             assert!(!config.is_reasoning_model());
+        }
+    }
+
+    mod max_output_tokens {
+        use super::*;
+
+        const ENV_LOCK_KEYS: [(&str, Option<&str>); 5] = [
+            ("GOOSE_MAX_TOKENS", None),
+            ("GOOSE_TEMPERATURE", None),
+            ("GOOSE_CONTEXT_LIMIT", None),
+            ("GOOSE_TOOLSHIM", None),
+            ("GOOSE_TOOLSHIM_OLLAMA_MODEL", None),
+        ];
+
+        #[test]
+        fn defaults_gemini_models_to_64k() {
+            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
+            assert_eq!(ModelConfig::new("gemini-2.5-flash").max_output_tokens(), 65_536);
+            assert_eq!(ModelConfig::new("gemini-2.5-pro").max_output_tokens(), 65_536);
+            assert_eq!(ModelConfig::new("gemini-3-flash").max_output_tokens(), 65_536);
+            assert_eq!(ModelConfig::new("gemini-3-pro-preview").max_output_tokens(), 65_536);
+        }
+
+        #[test]
+        fn defaults_other_models_to_4k() {
+            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
+            assert_eq!(ModelConfig::new("gpt-4o").max_output_tokens(), 4_096);
+            assert_eq!(ModelConfig::new("claude-sonnet-4").max_output_tokens(), 4_096);
+        }
+
+        #[test]
+        fn respects_explicit_max_tokens() {
+            let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
+            let mut config = ModelConfig::new("gemini-2.5-flash");
+            config.max_tokens = Some(8_192);
+            assert_eq!(config.max_output_tokens(), 8_192);
         }
     }
 }
