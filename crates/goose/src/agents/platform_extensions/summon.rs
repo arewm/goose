@@ -98,6 +98,8 @@ struct AgentMetadata {
     description: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
@@ -127,6 +129,12 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
     let mut properties = std::collections::HashMap::new();
     if let Some(model) = metadata.model {
         properties.insert("model".to_string(), serde_json::Value::String(model));
+    }
+    if let Some(provider) = metadata.provider {
+        properties.insert(
+            "provider".to_string(),
+            serde_json::Value::String(provider),
+        );
     }
 
     Some(SourceEntry {
@@ -375,7 +383,11 @@ fn build_subagent_instructions(sources: &[SourceEntry]) -> String {
          instructions: ...)`, which runs it as an isolated subagent and \
          returns its result. Use `load(source: \"<name>\")` instead if you \
          only want to read the subagent's instructions into your own \
-         context.",
+         context. For long-running work, pass `async: true` to `delegate` — \
+         it returns a task id immediately, and you collect the result later \
+         with `load(source: "<task_id>")`, which waits for completion.\n\n\
+         When overriding subagent models, use the appropriate configured provider \
+         (e.g. `gcp_vertex_ai` for Google Gemini models, `openai` for OpenAI models).",
     ));
 
     out
@@ -515,7 +527,7 @@ impl SummonClient {
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Override LLM provider."
+                    "description": "Override LLM provider (e.g. 'openai', 'gcp_vertex_ai'). Note: for Google Gemini models, use 'gcp_vertex_ai' (not 'google')."
                 },
                 "model": {
                     "type": "string",
@@ -1233,15 +1245,25 @@ impl SummonClient {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
+        let provider = source
+            .properties
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
         // max_turns is set later in resolve_subagent_config so it can incorporate params.max_turns
         // with the correct priority ordering; setting it here would cause it to be overridden
         // by the parent session's recipe instead.
-        let settings = model.map(|m| Settings {
-            goose_model: Some(m),
-            goose_provider: params.provider.clone(),
-            temperature: params.temperature,
-            max_turns: None,
-        });
+        let settings = if model.is_some() || provider.is_some() || params.temperature.is_some() {
+            Some(Settings {
+                goose_model: model,
+                goose_provider: provider,
+                temperature: params.temperature,
+                max_turns: None,
+            })
+        } else {
+            None
+        };
 
         let mut builder = Recipe::builder()
             .version("1.0.0")
@@ -1376,49 +1398,70 @@ impl SummonClient {
             .as_ref()
             .and_then(|values| values.get("GOOSE_SUBAGENT_MODEL"))
             .and_then(serde_json::Value::as_str);
-        let matches_provider =
-            |candidate: Option<&str>| candidate.is_none() || candidate == Some(provider_name);
-        let model = recipe_settings
-            .and_then(|settings| settings.goose_model.clone())
-            .filter(|_| {
-                matches_provider(
-                    recipe_settings.and_then(|settings| settings.goose_provider.as_deref()),
-                )
-            })
-            .or_else(|| {
-                env_model
-                    .clone()
-                    .filter(|_| matches_provider(env_provider.as_deref()))
-            })
-            .or_else(|| {
-                params
-                    .model
-                    .clone()
-                    .filter(|_| matches_provider(params.provider.as_deref()))
-            })
-            .or_else(|| {
-                configured_model
-                    .filter(|_| matches_provider(configured_provider))
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                session
-                    .model_config
-                    .as_ref()
-                    .filter(|_| matches_provider(session.provider_name.as_deref()))
-                    .map(|config| config.model_name.clone())
-            })
-            .or_else(|| {
-                provider_default_model
-                    .filter(|model| !model.is_empty())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No model configured for provider '{}'; set GOOSE_SUBAGENT_MODEL",
-                    provider_name
-                )
-            })?;
+        let matches_provider = |candidate: Option<&str>| {
+            candidate.is_none()
+                || candidate == Some(provider_name)
+                || (provider_name == "gcp_vertex_ai" && candidate == Some("google"))
+        };
+        let recipe_has_incompatible_unqualified_model = {
+            let recipe_prov = recipe_settings.and_then(|s| s.goose_provider.as_deref());
+            let caller_prov = params.provider.as_deref();
+            recipe_prov.is_none()
+                && caller_prov.is_some()
+                && caller_prov != session.provider_name.as_deref()
+                && (caller_prov != Some("google") || provider_name != "gcp_vertex_ai")
+        };
+        let model = if let Some(env_m) =
+            env_model.filter(|_| matches_provider(env_provider.as_deref()))
+        {
+            if params.model.is_none()
+                && recipe_settings
+                    .and_then(|s| s.goose_model.as_ref())
+                    .is_some()
+            {
+                recipe_settings
+                    .and_then(|s| s.goose_model.clone())
+                    .filter(|_| {
+                        matches_provider(recipe_settings.and_then(|s| s.goose_provider.as_deref()))
+                    })
+                    .unwrap_or(env_m)
+            } else {
+                env_m
+            }
+        } else if let Some(param_m) = params
+            .model
+            .clone()
+            .filter(|_| matches_provider(params.provider.as_deref()))
+        {
+            param_m
+        } else if !recipe_has_incompatible_unqualified_model
+            && recipe_settings
+                .and_then(|s| s.goose_model.as_ref())
+                .is_some_and(|_| {
+                    matches_provider(recipe_settings.and_then(|s| s.goose_provider.as_deref()))
+                })
+        {
+            recipe_settings
+                .and_then(|s| s.goose_model.clone())
+                .expect("guaranteed Some by is_some_and above")
+        } else if let Some(cfg_m) =
+            configured_model.filter(|_| matches_provider(configured_provider))
+        {
+            cfg_m.to_string()
+        } else if let Some(sess_m) = session
+            .model_config
+            .as_ref()
+            .filter(|_| matches_provider(session.provider_name.as_deref()))
+        {
+            sess_m.model_name.clone()
+        } else if let Some(def_m) = provider_default_model.filter(|model| !model.is_empty()) {
+            def_m.to_string()
+        } else {
+            anyhow::bail!(
+                "No model configured for provider '{}'; set GOOSE_SUBAGENT_MODEL",
+                provider_name
+            );
+        };
 
         let parent = session.model_config.as_ref();
         let mut model_config = if parent.is_some_and(|config| {
@@ -1457,7 +1500,7 @@ impl SummonClient {
         session: &crate::session::Session,
     ) -> Result<(String, goose_providers::model::ModelConfig)> {
         let env_provider = std::env::var("GOOSE_SUBAGENT_PROVIDER").ok();
-        let provider_name = recipe
+        let mut provider_name = recipe
             .settings
             .as_ref()
             .and_then(|s| s.goose_provider.clone())
@@ -1470,6 +1513,25 @@ impl SummonClient {
             })
             .or_else(|| session.provider_name.clone())
             .ok_or_else(|| anyhow::anyhow!("No provider configured"))?;
+
+        if provider_name == "google" {
+            let global_cfg = Config::global();
+            let google_entry = crate::config::get_provider_entry(global_cfg, "google");
+            let vertex_entry = crate::config::get_provider_entry(global_cfg, "gcp_vertex_ai");
+            let google_configured =
+                google_entry.as_ref().is_some_and(|e| e.configured && e.enabled);
+            let vertex_configured =
+                vertex_entry.as_ref().is_some_and(|e| e.configured && e.enabled)
+                    || crate::config::get_active_provider(global_cfg).as_deref()
+                        == Some("gcp_vertex_ai");
+
+            if !google_configured && vertex_configured {
+                tracing::info!(
+                    "Auto-routing requested provider 'google' to configured 'gcp_vertex_ai'"
+                );
+                provider_name = "gcp_vertex_ai".to_string();
+            }
+        }
 
         let provider_entry = providers::get_from_registry(&provider_name).await;
         let provider_default_model = provider_entry
@@ -2882,6 +2944,134 @@ You review code."#;
         assert!(error
             .to_string()
             .contains("No model configured for provider 'lmstudio'"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_params_model_overrides_recipe_model() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let mut recipe = empty_recipe();
+        recipe.settings = Some(crate::recipe::Settings {
+            goose_provider: None,
+            goose_model: Some("recipe-default-model".to_string()),
+            temperature: None,
+            max_turns: None,
+        });
+        let params = DelegateParams {
+            model: Some("explicit-override-model".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .resolve_model_config(
+                &params,
+                &recipe,
+                &session_with(parent_config()),
+                PROVIDER,
+                None,
+            )
+            .expect("resolve_model_config");
+        assert_eq!(
+            result.model_name, "explicit-override-model",
+            "params.model must take priority over recipe settings when GOOSE_SUBAGENT_MODEL is not set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_recipe_preserves_provider() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let mut source = SourceEntry {
+            source_type: SourceType::Agent,
+            name: "test-agent".to_string(),
+            description: "A test agent".to_string(),
+            content: "Agent instructions".to_string(),
+            path: "/path/to/agent.md".to_string(),
+            global: false,
+            writable: true,
+            supporting_files: Vec::new(),
+            properties: HashMap::new(),
+        };
+        source.properties.insert(
+            "model".to_string(),
+            serde_json::Value::String("gpt-5.5".to_string()),
+        );
+
+        let params = DelegateParams {
+            provider: Some("gcp_vertex_ai".to_string()),
+            ..Default::default()
+        };
+
+        let recipe = client.build_recipe_from_agent(&source, &params).unwrap();
+        let settings = recipe.settings.unwrap();
+        assert_eq!(settings.goose_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            settings.goose_provider, None,
+            "agent recipe must not stamp params.provider as its own provider"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_google_routed_to_vertex_keeps_explicit_model() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let params = DelegateParams {
+            provider: Some("google".to_string()),
+            model: Some("gemini-3.8-flash".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .resolve_model_config(
+                &params,
+                &empty_recipe(),
+                &session_with(parent_config()),
+                "gcp_vertex_ai",
+                None,
+            )
+            .expect("resolve_model_config");
+        assert_eq!(
+            result.model_name, "gemini-3.8-flash",
+            "explicit model with provider 'google' must be preserved when auto-routed to 'gcp_vertex_ai'"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_provider_override_drops_unqualified_recipe_model() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let mut recipe = empty_recipe();
+        recipe.settings = Some(crate::recipe::Settings {
+            goose_provider: None,
+            goose_model: Some("gpt-5.5".to_string()),
+            temperature: None,
+            max_turns: None,
+        });
+        let params = DelegateParams {
+            provider: Some("gcp_vertex_ai".to_string()),
+            model: None,
+            ..Default::default()
+        };
+        let session = crate::session::Session {
+            provider_name: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .resolve_model_config(
+                &params,
+                &recipe,
+                &session,
+                "gcp_vertex_ai",
+                Some("gemini-default"),
+            )
+            .expect("resolve_model_config");
+        assert_eq!(
+            result.model_name, "gemini-default",
+            "overriding provider without model must not pass incompatible unqualified recipe model"
+        );
     }
 
     fn test_tool_notification(request_id: &str, subagent_id: &str) -> ServerNotification {
