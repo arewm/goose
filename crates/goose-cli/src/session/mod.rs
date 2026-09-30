@@ -252,6 +252,10 @@ pub struct CliSession {
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     loading_announced: bool,
+    /// Last (provider, model) that completed a turn successfully. A request
+    /// failure after a mid-session `/model` switch reverts to this so a bad
+    /// switch cannot brick the session.
+    last_good_model: Option<(String, goose_providers::model::ModelConfig)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +340,7 @@ impl CliSession {
             stats,
             extension_loading,
             loading_announced: false,
+            last_good_model: None,
         }
     }
 
@@ -991,8 +996,53 @@ impl CliSession {
             return Ok(());
         }
 
+        // Catalog-aware model resolution: `/model <name>` used to accept any
+        // string verbatim, so an unknown ID switched "successfully" with a
+        // fabricated default context window and only failed at request time
+        // with an opaque 404. Resolve the requested name against the target
+        // provider's live catalog (and, when no provider was specified, the
+        // other configured providers), presenting candidates when the request
+        // is ambiguous and erroring with suggestions when nothing matches.
+        let mut target_provider_name = target_provider_name.to_string();
         let target_model_name = match options.model.as_deref().map(str::trim) {
-            Some(m) if !m.is_empty() => m.to_string(),
+            Some(m) if !m.is_empty() => {
+                match self
+                    .resolve_requested_model(m, &target_provider_name, requested_provider.is_some())
+                    .await?
+                {
+                    ModelRequestResolution::Resolved { provider, model } => {
+                        target_provider_name = provider;
+                        model
+                    }
+                    ModelRequestResolution::Ambiguous { candidates } => {
+                        let mut listing = format!("Multiple models match '{}':\n", m);
+                        for (provider, model) in candidates {
+                            listing.push_str(&format!("  {model} ({provider})\n"));
+                        }
+                        listing.push_str(
+                            "Re-run /model with the full model name (or use \
+                             '/model --provider <name> <model>' to pick a specific provider).",
+                        );
+                        output::goose_mode_message(&listing);
+                        return Ok(());
+                    }
+                    ModelRequestResolution::NotFound { suggestions } => {
+                        let suggestions = if suggestions.is_empty() {
+                            "No similar models found.".to_string()
+                        } else {
+                            format!("Closest available models: {}.", suggestions.join(", "))
+                        };
+                        output::render_error(&format!(
+                            "No configured provider serves a model matching '{}'. {}\n\
+                             Use /model with no arguments to see the current model, or pick a \
+                             model from the provider's catalog.",
+                            m, suggestions
+                        ));
+                        return Ok(());
+                    }
+                    ModelRequestResolution::CatalogUnavailable => m.to_string(),
+                }
+            }
             _ => {
                 if target_provider_name == current_provider_name {
                     current_model_name.clone()
@@ -1013,7 +1063,7 @@ impl CliSession {
         };
 
         let new_model_config = build_switched_model_config(
-            target_provider_name,
+            &target_provider_name,
             &target_model_name,
             &current_model_config,
         )?;
@@ -1042,7 +1092,7 @@ impl CliSession {
         let new_provider = match session_provider(
             &self.agent,
             &self.session_id,
-            target_provider_name,
+            &target_provider_name,
         )
         .await
         {
@@ -1071,6 +1121,26 @@ impl CliSession {
             &new_model_config.model_name,
         )
         .await?;
+
+        // Block switches that cannot fit the live session: the old check only
+        // compared context windows to each other, so a large live session
+        // could switch onto a smaller-context model and then fail on (or
+        // during) its very next request, bricking the session.
+        let session_tokens = self
+            .get_session()
+            .await
+            .map(|session| session.usage.total_tokens.unwrap_or(0) as usize)
+            .unwrap_or(0);
+        if new_context_limit < session_tokens {
+            output::render_error(&format!(
+                "Cannot switch to model '{}': this session is using {} tokens, but '{}' \
+                 supports a {}-token context window. Run /compact first, or choose a \
+                 larger-context model.",
+                target_model_name, session_tokens, target_model_name, new_context_limit
+            ));
+            return Ok(());
+        }
+
         if new_context_limit < current_context_limit {
             eprintln!(
                 "{}",
@@ -1083,7 +1153,7 @@ impl CliSession {
         }
 
         self.agent
-            .switch_provider(&self.session_id, target_provider_name, new_model_config)
+            .switch_provider(&self.session_id, &target_provider_name, new_model_config)
             .await?;
 
         self.update_completion_cache().await?;
@@ -1376,8 +1446,18 @@ impl CliSession {
         let _drop_handle = AbortOnDropHandle::new(handle);
 
         program_status::report(ProgramStatus::Working, None);
-        let mut stream = self
-            .agent
+
+        // Type-ahead: capture queued next-step messages while the turn
+        // runs. Dropping the reader at the end of the response restores
+        // the terminal before the prompt or drain loop touches stdin.
+        let _typeahead_reader = interactive
+            .then(|| queue::spawn_typeahead_reader(self.queue.clone(), cancel_token.clone()));
+
+        // Clone the agent handle so the reply stream borrows the local Arc
+        // rather than `self`; the post-turn model bookkeeping below needs
+        // `&mut self` while the stream is still alive.
+        let agent = Arc::clone(&self.agent);
+        let mut stream = agent
             .reply(
                 user_message.clone(),
                 session_config.clone(),
@@ -1609,6 +1689,11 @@ impl CliSession {
                 .messages
                 .last()
                 .is_some_and(|message| message.error_kind().is_some());
+        if failed {
+            self.revert_model_after_stream_failure().await;
+        } else {
+            self.record_last_good_model().await;
+        }
         let terminal_error = headless_run_error(
             interactive,
             cancel_token_clone.is_cancelled(),
@@ -1893,7 +1978,20 @@ impl CliSession {
             }
         }
 
-        cache.provider_names = all_providers.iter().map(|(m, _)| m.name.clone()).collect();
+        // Only providers explicitly configured (and enabled) in the user's
+        // config are offered for completion. Registry providers the user has
+        // never configured stay hidden here but remain reachable explicitly
+        // via `--provider` or GOOSE_PROVIDER, matching the env-var override
+        // workflow.
+        cache.provider_names = all_providers
+            .iter()
+            .filter(|(metadata, _)| {
+                providers::get_provider_entry(config, &metadata.name)
+                    .map(|entry| entry.enabled)
+                    .unwrap_or(false)
+            })
+            .map(|(metadata, _)| metadata.name.clone())
+            .collect();
         cache.current_session_provider = session_provider;
         cache.provider_models.clear();
         for (metadata, _) in &all_providers {
@@ -1964,6 +2062,187 @@ impl CliSession {
             .session_manager
             .get_session(&self.session_id, false)
             .await
+    }
+
+    /// Record the session's current (provider, model) as the last
+    /// configuration to complete a turn successfully.
+    async fn record_last_good_model(&mut self) {
+        if let (Ok(provider), Ok(model_config)) = (
+            self.agent.provider(&self.session_id).await,
+            self.agent.model_config_for_session(&self.session_id).await,
+        ) {
+            self.last_good_model = Some((provider.get_name().to_string(), model_config));
+        }
+    }
+
+    /// Revert to the last model that completed a turn successfully when a
+    /// request fails, so a mid-session `/model` switch to an unavailable
+    /// model cannot leave the session stuck. Transient failures on an
+    /// established model do not revert: its last successful turn already
+    /// recorded it as known-good, so current and last-good match.
+    async fn revert_model_after_stream_failure(&mut self) {
+        let Some((provider_name, model_config)) = self.last_good_model.clone() else {
+            return;
+        };
+        let current_model = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await
+            .ok()
+            .map(|config| config.model_name);
+        let current_provider = self
+            .agent
+            .provider(&self.session_id)
+            .await
+            .ok()
+            .map(|provider| provider.get_name().to_string());
+        if current_model.as_deref() == Some(model_config.model_name.as_str())
+            && current_provider.as_deref() == Some(provider_name.as_str())
+        {
+            return;
+        }
+        let switched_to = current_model.unwrap_or_else(|| "unknown".to_string());
+        let target_model = model_config.model_name.clone();
+        match self
+            .agent
+            .switch_provider(&self.session_id, &provider_name, model_config)
+            .await
+        {
+            Ok(()) => {
+                output::render_text(
+                    &format!(
+                        "Request failed on model '{switched_to}'. Reverted to provider \
+                         '{provider_name}' / model '{target_model}' so the session stays \
+                         usable; the failed model may be unavailable (check with /model).",
+                    ),
+                    Some(Color::Yellow),
+                    true,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to revert to provider '{provider_name}' / model \
+                     '{target_model}' after a stream error: {error}"
+                );
+            }
+        }
+    }
+
+    /// Resolve a `/model <name>` request against provider catalogs.
+    ///
+    /// When `provider_explicit` is set, only that provider's catalog is
+    /// searched. Otherwise the target provider is searched first, and, if it
+    /// serves no match, every other configured provider is swept so a family
+    /// name available elsewhere (e.g. `sol` on an OpenAI-compatible provider
+    /// while the session runs an Anthropic-compatible one) can still resolve,
+    /// switching providers as part of the resolution.
+    async fn resolve_requested_model(
+        &self,
+        requested: &str,
+        target_provider_name: &str,
+        provider_explicit: bool,
+    ) -> Result<ModelRequestResolution> {
+        let target_catalog = fetch_provider_catalog(target_provider_name).await;
+        if provider_explicit {
+            let catalog = match target_catalog {
+                Some(catalog) => catalog,
+                None => return Ok(ModelRequestResolution::CatalogUnavailable),
+            };
+            let matches = goose::providers::model_resolution::matching_models(requested, &catalog);
+            return Ok(match matches.len() {
+                0 => ModelRequestResolution::NotFound {
+                    suggestions: goose::providers::model_resolution::token_shared_suggestions(
+                        requested,
+                        &[(target_provider_name.to_string(), catalog)],
+                    ),
+                },
+                1 => ModelRequestResolution::Resolved {
+                    provider: target_provider_name.to_string(),
+                    model: matches.into_iter().next().expect("non-empty"),
+                },
+                _ => ModelRequestResolution::Ambiguous {
+                    candidates: matches
+                        .iter()
+                        .rev()
+                        .map(|model| (target_provider_name.to_string(), model.clone()))
+                        .collect(),
+                },
+            });
+        }
+
+        if let Some(catalog) = &target_catalog {
+            let mut matches =
+                goose::providers::model_resolution::matching_models(requested, catalog);
+            match matches.len() {
+                0 => {}
+                1 => {
+                    return Ok(ModelRequestResolution::Resolved {
+                        provider: target_provider_name.to_string(),
+                        model: matches.remove(0),
+                    })
+                }
+                _ => {
+                    let candidates = matches
+                        .iter()
+                        .rev()
+                        .map(|model| (target_provider_name.to_string(), model.clone()))
+                        .collect();
+                    return Ok(ModelRequestResolution::Ambiguous { candidates });
+                }
+            }
+        }
+
+        // The target provider serves no match; sweep the other configured
+        // providers so a family name served elsewhere can resolve.
+        let mut other_providers: Vec<(String, Vec<String>)> = Vec::new();
+        for (metadata, _) in goose::providers::providers().await {
+            if metadata.name == target_provider_name || metadata.name.ends_with("-acp") {
+                continue;
+            }
+            let configured = goose::providers::get_from_registry(&metadata.name)
+                .await
+                .map(|entry| entry.inventory_configured())
+                .unwrap_or(false)
+                && goose::config::get_provider_entry(Config::global(), &metadata.name)
+                    .map(|entry| entry.enabled)
+                    .unwrap_or(false);
+            if !configured {
+                continue;
+            }
+            if let Some(catalog) = fetch_provider_catalog(&metadata.name).await {
+                other_providers.push((metadata.name.clone(), catalog));
+            }
+        }
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for (name, catalog) in &other_providers {
+            for model in goose::providers::model_resolution::matching_models(requested, catalog) {
+                candidates.push((name.clone(), model));
+            }
+        }
+        if !candidates.is_empty() {
+            // Best (most advanced) variant of each provider sorts last from
+            // matching_models; present providers in a stable order with the
+            // best candidate first overall.
+            candidates.sort();
+            candidates.dedup();
+            candidates.reverse();
+            if candidates.len() == 1 {
+                let (provider, model) = candidates.remove(0);
+                return Ok(ModelRequestResolution::Resolved { provider, model });
+            }
+            return Ok(ModelRequestResolution::Ambiguous { candidates });
+        }
+
+        let mut suggestion_catalogs = other_providers;
+        if let Some(catalog) = target_catalog {
+            suggestion_catalogs.push((target_provider_name.to_string(), catalog.clone()));
+        }
+        let suggestions = goose::providers::model_resolution::token_shared_suggestions(
+            requested,
+            &suggestion_catalogs,
+        );
+        Ok(ModelRequestResolution::NotFound { suggestions })
     }
 
     pub async fn get_total_token_usage(&self) -> Result<Option<i32>> {
@@ -2106,6 +2385,34 @@ pub(crate) async fn session_provider(
         .await?;
     session.provider_name = Some(provider_name.to_string());
     agent.config.providers.provider_for(&session).await
+}
+
+/// Outcome of resolving a `/model <name>` request against provider catalogs.
+enum ModelRequestResolution {
+    /// A single catalog entry matched; switching proceeds with this
+    /// (provider, model) pair, which may differ from the session's current
+    /// provider when the model is served elsewhere.
+    Resolved { provider: String, model: String },
+    /// Multiple catalog entries matched; the caller presents the candidates
+    /// for the user to choose between.
+    Ambiguous { candidates: Vec<(String, String)> },
+    /// Nothing matched; the closest suggestions are included for the error.
+    NotFound { suggestions: Vec<String> },
+    /// The provider's catalog could not be fetched, so the request cannot be
+    /// validated; callers fall back to accepting the raw name.
+    CatalogUnavailable,
+}
+
+/// Fetch a provider's model catalog, returning `None` when the provider
+/// cannot be constructed or does not expose a usable catalog.
+async fn fetch_provider_catalog(provider_name: &str) -> Option<Vec<String>> {
+    let provider = goose::providers::create(provider_name, Vec::new())
+        .await
+        .ok()?;
+    match provider.fetch_supported_models().await {
+        Ok(models) if !models.is_empty() => Some(models),
+        _ => None,
+    }
 }
 
 async fn create_successor_session(

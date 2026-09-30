@@ -31,6 +31,13 @@ use tracing::warn;
 
 pub static EXTENSION_NAME: &str = "summon";
 
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
+const CATALOG_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(60);
+const PERSISTED_CATALOG_MAX_AGE_HOURS: i64 = 24;
+type CatalogCache = std::sync::Mutex<HashMap<String, (Instant, Option<Vec<String>>)>>;
+static CATALOG_CACHE: once_cell::sync::Lazy<CatalogCache> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
 const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
 fn kind_plural(kind: SourceType) -> &'static str {
@@ -56,6 +63,8 @@ pub struct DelegateParams {
     pub working_dir: Option<String>,
     pub resume: Option<String>,
 }
+
+use crate::providers::model_resolution::model_tokens;
 
 const DEFAULT_RESUME_INSTRUCTIONS: &str = "Continue the task from where you left off.";
 
@@ -91,6 +100,8 @@ struct AgentMetadata {
     description: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
@@ -120,6 +131,12 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
     let mut properties = std::collections::HashMap::new();
     if let Some(model) = metadata.model {
         properties.insert("model".to_string(), serde_json::Value::String(model));
+    }
+    if let Some(provider) = metadata.provider {
+        properties.insert(
+            "provider".to_string(),
+            serde_json::Value::String(provider),
+        );
     }
 
     Some(SourceEntry {
@@ -381,21 +398,15 @@ fn build_subagent_instructions(sources: &[SourceEntry]) -> String {
          instructions: ...)`, which runs it as an isolated subagent and \
          returns its result. Use `load(source: \"<name>\")` instead if you \
          only want to read the subagent's instructions into your own \
-<<<<<<< HEAD
-         context.",
-||||||| parent of 0871051 (agent: Preserve inspection context in tool denials)
-         context. For long-running work, pass `async: true` to `delegate` — \
-         it returns a task id immediately, and you collect the result later \
-         with `load(source: "<task_id>")`, which waits for completion.\n\n\
-         When overriding subagent models, use the appropriate configured provider \
-         (e.g. `gcp_vertex_ai` for Google Gemini models, `openai` for OpenAI models).",
-=======
          context. For long-running work, pass `async: true` to `delegate` — \
          it returns a task id immediately, and you collect the result later \
          using `load` with the returned task ID to wait for completion.\n\n\
-         When overriding subagent models, use the appropriate configured provider \
-         (e.g. `gcp_vertex_ai` for Google Gemini models, `openai` for OpenAI models).",
->>>>>>> 0871051 (agent: Preserve inspection context in tool denials)
+         When overriding subagent models, pass a model family name (e.g. `opus`, \
+         `luna`, `sonnet`), optionally with a version (e.g. `luna 5.6`) — goose \
+         resolves it against each provider's live catalog and picks the most \
+         advanced matching variant, routing to a provider that serves it if \
+         needed. If nothing matches, the error lists the closest available \
+         models; retry with one of those instead of inventing model IDs.",
     ));
 
     out
@@ -510,11 +521,11 @@ impl SummonClient {
                 },
                 "provider": {
                     "type": "string",
-                    "description": "Override LLM provider."
+                    "description": "Override LLM provider (e.g. 'openai', 'gcp_vertex_ai'). Note: for Google Gemini models, use 'gcp_vertex_ai' (not 'google')."
                 },
                 "model": {
                     "type": "string",
-                    "description": "Override model."
+                    "description": "Override model. Prefer a family name (e.g. 'opus', 'luna'), optionally with a version (e.g. 'luna 5.6'); goose resolves it to the best available match and errors with suggestions if none matches."
                 },
                 "temperature": {
                     "type": "number",
@@ -958,6 +969,10 @@ impl SummonClient {
             })?;
 
         let max_turns = subagent_config.max_turns;
+        let subagent_runtime = format!(
+            "{} / {}",
+            subagent_config.provider_name, subagent_config.model_config.model_name
+        );
         recipe
             .settings
             .get_or_insert(Settings {
@@ -1021,7 +1036,10 @@ impl SummonClient {
             .map_err(|e| format!("Failed to save delegate task: {e}"))?;
 
         Ok(delegated_result(
-            format!("Delegated to subagent {}", child.id),
+            format!(
+                "Delegated to subagent {} (running on {})",
+                child.id, subagent_runtime
+            ),
             &child.id,
         ))
     }
@@ -1223,12 +1241,22 @@ impl SummonClient {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
 
-        let settings = model.map(|m| Settings {
-            goose_model: Some(m),
-            goose_provider: params.provider.clone(),
-            temperature: params.temperature,
-            max_turns: None,
-        });
+        let provider = source
+            .properties
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+
+        let settings = if model.is_some() || provider.is_some() || params.temperature.is_some() {
+            Some(Settings {
+                goose_model: model,
+                goose_provider: provider,
+                temperature: params.temperature,
+                max_turns: None,
+            })
+        } else {
+            None
+        };
 
         let mut builder = Recipe::builder()
             .version("1.0.0")
@@ -1332,49 +1360,70 @@ impl SummonClient {
             .as_ref()
             .and_then(|values| values.get("GOOSE_SUBAGENT_MODEL"))
             .and_then(serde_json::Value::as_str);
-        let matches_provider =
-            |candidate: Option<&str>| candidate.is_none() || candidate == Some(provider_name);
-        let model = recipe_settings
-            .and_then(|settings| settings.goose_model.clone())
-            .filter(|_| {
-                matches_provider(
-                    recipe_settings.and_then(|settings| settings.goose_provider.as_deref()),
-                )
-            })
-            .or_else(|| {
-                env_model
-                    .clone()
-                    .filter(|_| matches_provider(env_provider.as_deref()))
-            })
-            .or_else(|| {
-                params
-                    .model
-                    .clone()
-                    .filter(|_| matches_provider(params.provider.as_deref()))
-            })
-            .or_else(|| {
-                configured_model
-                    .filter(|_| matches_provider(configured_provider))
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                session
-                    .model_config
-                    .as_ref()
-                    .filter(|_| matches_provider(session.provider_name.as_deref()))
-                    .map(|config| config.model_name.clone())
-            })
-            .or_else(|| {
-                provider_default_model
-                    .filter(|model| !model.is_empty())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No model configured for provider '{}'; set GOOSE_SUBAGENT_MODEL",
-                    provider_name
-                )
-            })?;
+        let matches_provider = |candidate: Option<&str>| {
+            candidate.is_none()
+                || candidate == Some(provider_name)
+                || (provider_name == "gcp_vertex_ai" && candidate == Some("google"))
+        };
+        let recipe_has_incompatible_unqualified_model = {
+            let recipe_prov = recipe_settings.and_then(|s| s.goose_provider.as_deref());
+            let caller_prov = params.provider.as_deref();
+            recipe_prov.is_none()
+                && caller_prov.is_some()
+                && caller_prov != session.provider_name.as_deref()
+                && (caller_prov != Some("google") || provider_name != "gcp_vertex_ai")
+        };
+        let model = if let Some(env_m) =
+            env_model.filter(|_| matches_provider(env_provider.as_deref()))
+        {
+            if params.model.is_none()
+                && recipe_settings
+                    .and_then(|s| s.goose_model.as_ref())
+                    .is_some()
+            {
+                recipe_settings
+                    .and_then(|s| s.goose_model.clone())
+                    .filter(|_| {
+                        matches_provider(recipe_settings.and_then(|s| s.goose_provider.as_deref()))
+                    })
+                    .unwrap_or(env_m)
+            } else {
+                env_m
+            }
+        } else if let Some(param_m) = params
+            .model
+            .clone()
+            .filter(|_| matches_provider(params.provider.as_deref()))
+        {
+            param_m
+        } else if !recipe_has_incompatible_unqualified_model
+            && recipe_settings
+                .and_then(|s| s.goose_model.as_ref())
+                .is_some_and(|_| {
+                    matches_provider(recipe_settings.and_then(|s| s.goose_provider.as_deref()))
+                })
+        {
+            recipe_settings
+                .and_then(|s| s.goose_model.clone())
+                .expect("guaranteed Some by is_some_and above")
+        } else if let Some(cfg_m) =
+            configured_model.filter(|_| matches_provider(configured_provider))
+        {
+            cfg_m.to_string()
+        } else if let Some(sess_m) = session
+            .model_config
+            .as_ref()
+            .filter(|_| matches_provider(session.provider_name.as_deref()))
+        {
+            sess_m.model_name.clone()
+        } else if let Some(def_m) = provider_default_model.filter(|model| !model.is_empty()) {
+            def_m.to_string()
+        } else {
+            anyhow::bail!(
+                "No model configured for provider '{}'; set GOOSE_SUBAGENT_MODEL",
+                provider_name
+            );
+        };
 
         let parent = session.model_config.as_ref();
         let mut model_config = if parent.is_some_and(|config| {
@@ -1413,7 +1462,7 @@ impl SummonClient {
         session: &crate::session::Session,
     ) -> Result<(String, goose_providers::model::ModelConfig)> {
         let env_provider = std::env::var("GOOSE_SUBAGENT_PROVIDER").ok();
-        let provider_name = recipe
+        let mut provider_name = recipe
             .settings
             .as_ref()
             .and_then(|s| s.goose_provider.clone())
@@ -1427,6 +1476,25 @@ impl SummonClient {
             .or_else(|| session.provider_name.clone())
             .ok_or_else(|| anyhow::anyhow!("No provider configured"))?;
 
+        if provider_name == "google" {
+            let global_cfg = Config::global();
+            let google_entry = crate::config::get_provider_entry(global_cfg, "google");
+            let vertex_entry = crate::config::get_provider_entry(global_cfg, "gcp_vertex_ai");
+            let google_configured =
+                google_entry.as_ref().is_some_and(|e| e.configured && e.enabled);
+            let vertex_configured =
+                vertex_entry.as_ref().is_some_and(|e| e.configured && e.enabled)
+                    || crate::config::get_active_provider(global_cfg).as_deref()
+                        == Some("gcp_vertex_ai");
+
+            if !google_configured && vertex_configured {
+                tracing::info!(
+                    "Auto-routing requested provider 'google' to configured 'gcp_vertex_ai'"
+                );
+                provider_name = "gcp_vertex_ai".to_string();
+            }
+        }
+
         let provider_entry = providers::get_from_registry(&provider_name).await;
         let provider_default_model = provider_entry
             .as_ref()
@@ -1439,7 +1507,227 @@ impl SummonClient {
             &provider_name,
             provider_default_model,
         )?;
+
+        // Catalog-aware model resolution: delegations used to pass whatever
+        // model string the recipe or caller supplied straight to the provider,
+        // so a model from another family (e.g. an agent file pinning an OpenAI
+        // model while the session runs a custom Anthropic-compatible provider)
+        // failed at request time with an opaque 404.
+        let (mut provider_name, mut model_config) = (provider_name, model_config);
+        if let Some(catalog) = self.provider_catalog(&provider_name).await {
+            match Self::best_catalog_match(&model_config.model_name, &catalog) {
+                Some(matched) => {
+                    if matched != model_config.model_name {
+                        warn!(
+                            "Delegate model '{}' resolved to '{}' on provider '{}'",
+                            model_config.model_name, matched, provider_name
+                        );
+                        model_config.model_name = matched;
+                    }
+                }
+                None => {
+                    let session_model_matches = session
+                        .model_config
+                        .as_ref()
+                        .filter(|_| {
+                            session.provider_name.as_deref() == Some(provider_name.as_str())
+                        })
+                        .map(|config| config.model_name.clone())
+                        .filter(|model| Self::best_catalog_match(model, &catalog).is_some());
+                    if params.model.is_some() && params.provider.is_none() {
+                        let (best, suggestions) = self
+                            .sweep_configured_providers(&model_config.model_name)
+                            .await;
+                        if let Some((alt_provider, alt_model)) = best {
+                            warn!(
+                                "No model '{}' on provider '{}'; delegating to provider \
+                                 '{}' as model '{}'",
+                                model_config.model_name, provider_name, alt_provider, alt_model
+                            );
+                            provider_name = alt_provider;
+                            model_config.model_name = alt_model;
+                            return Ok((provider_name, model_config));
+                        }
+                        let suggestions = suggestions.join(", ");
+                        anyhow::bail!(
+                            "No configured provider serves a model matching '{}'. {}",
+                            model_config.model_name,
+                            if suggestions.is_empty() {
+                                "Pass a model family name (e.g. 'opus', 'luna') or leave \
+                                 model unset to use the session model."
+                                    .to_string()
+                            } else {
+                                format!("Closest available models: {suggestions}.")
+                            }
+                        );
+                    }
+                    if let Some(session_model) = session_model_matches {
+                        warn!(
+                            "Delegate model '{}' is not served by provider '{}'; \
+                             falling back to session model '{}'",
+                            model_config.model_name, provider_name, session_model
+                        );
+                        model_config.model_name = session_model;
+                    }
+                }
+            }
+        }
         Ok((provider_name, model_config))
+    }
+
+    async fn provider_catalog(&self, provider_name: &str) -> Option<Vec<String>> {
+        if let Some((fetched_at, cached)) =
+            CATALOG_CACHE.lock().unwrap().get(provider_name).cloned()
+        {
+            let ttl = if cached.is_some() {
+                CATALOG_CACHE_TTL
+            } else {
+                CATALOG_CACHE_NEGATIVE_TTL
+            };
+            if fetched_at.elapsed() < ttl {
+                return cached;
+            }
+        }
+        if let Some(persisted) = self.persisted_catalog(provider_name).await {
+            CATALOG_CACHE.lock().unwrap().insert(
+                provider_name.to_string(),
+                (Instant::now(), Some(persisted.clone())),
+            );
+            return Some(persisted);
+        }
+        let fetched = match providers::create(provider_name, Vec::new()).await {
+            Ok(provider) => match provider.fetch_supported_models().await {
+                Ok(models) if !models.is_empty() => Some(models),
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(
+                        "Could not fetch model catalog for provider '{}' ({}); \
+                         skipping catalog-based model resolution",
+                        provider_name, error
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(
+                    "Could not construct provider '{}' for a catalog fetch ({}); \
+                     skipping catalog-based model resolution",
+                    provider_name, error
+                );
+                None
+            }
+        };
+        if let Some(models) = &fetched {
+            let service = crate::providers::inventory::ProviderInventoryService::new(
+                self.context.session_manager.storage().clone(),
+            );
+            if let Err(error) = service.store_refreshed_models(provider_name, models).await {
+                warn!(
+                    "Could not persist model catalog for provider '{}' ({}); \
+                     routing continues from the in-memory result",
+                    provider_name, error
+                );
+            }
+        }
+        CATALOG_CACHE
+            .lock()
+            .unwrap()
+            .insert(provider_name.to_string(), (Instant::now(), fetched.clone()));
+        fetched
+    }
+
+    /// The provider's last refreshed catalog from the persisted inventory
+    /// (shared with the desktop UI), usable without a network round trip.
+    /// Only a snapshot refreshed within the staleness window counts; entries
+    /// that were never refreshed fall through to a live fetch.
+    async fn persisted_catalog(&self, provider_name: &str) -> Option<Vec<String>> {
+        let service = crate::providers::inventory::ProviderInventoryService::new(
+            self.context.session_manager.storage().clone(),
+        );
+        let entry = service.entry_for_provider(provider_name).await.ok()??;
+        let updated_at = entry.last_updated_at?;
+        let age_hours = (chrono::Utc::now() - updated_at).num_hours();
+        if !(0..=PERSISTED_CATALOG_MAX_AGE_HOURS).contains(&age_hours) {
+            return None;
+        }
+        let models: Vec<String> = entry.models.into_iter().map(|model| model.id).collect();
+        (!models.is_empty()).then_some(models)
+    }
+
+    /// Resolve a requested model name against a provider's catalog. An exact
+    /// (normalized) match wins; otherwise the lexicographically greatest model
+    /// whose name contains the request is chosen, so a family name like "opus"
+    /// or "luna" resolves to its most advanced variant.
+    fn best_catalog_match(requested: &str, catalog: &[String]) -> Option<String> {
+        crate::providers::model_resolution::best_catalog_match(requested, catalog)
+    }
+
+    /// Names of providers that are configured and enabled.
+    async fn configured_provider_names(&self) -> Vec<String> {
+        let config = Config::global();
+        let mut names = Vec::new();
+        for (metadata, _) in providers::providers().await {
+            let configured = providers::get_from_registry(&metadata.name)
+                .await
+                .map(|entry| entry.inventory_configured())
+                .unwrap_or(false)
+                && crate::config::get_provider_entry(config, &metadata.name)
+                    .map(|entry| entry.enabled)
+                    .unwrap_or(true);
+            if configured {
+                names.push(metadata.name);
+            }
+        }
+        names
+    }
+
+    /// Sweep every configured provider's catalog in parallel, in a single
+    /// pass. Returns the best matching (provider, model) plus the closest
+    /// suggestions by shared token for error messages when nothing matched.
+    async fn sweep_configured_providers(
+        &self,
+        requested: &str,
+    ) -> (Option<(String, String)>, Vec<String>) {
+        let names = self.configured_provider_names().await;
+        let catalogs = futures::future::join_all(
+            names
+                .iter()
+                .map(|name| async move { (name.clone(), self.provider_catalog(name).await) }),
+        )
+        .await;
+
+        let mut best: Option<(String, String)> = None;
+        let mut suggestions: Vec<String> = Vec::new();
+        let requested_tokens = model_tokens(requested);
+        for (name, catalog) in catalogs {
+            let Some(catalog) = catalog else {
+                continue;
+            };
+            if let Some(model) = Self::best_catalog_match(requested, &catalog) {
+                let is_better = best
+                    .as_ref()
+                    .is_none_or(|(_, best_model)| model > *best_model);
+                if is_better {
+                    best = Some((name.clone(), model));
+                }
+            }
+            for model in catalog {
+                let shares_token = model_tokens(&model).iter().any(|token| {
+                    requested_tokens.iter().any(|requested| {
+                        token == requested
+                            || (token.chars().all(|c| c.is_ascii_digit())
+                                && token.starts_with(requested.as_str()))
+                    })
+                });
+                if shares_token {
+                    suggestions.push(format!("{model} ({name})"));
+                }
+            }
+        }
+        suggestions.sort();
+        suggestions.dedup();
+        suggestions.truncate(8);
+        (best, suggestions)
     }
 
     fn resolve_max_turns(params: &DelegateParams, recipe: &Recipe, config: &Config) -> usize {
@@ -1637,6 +1925,53 @@ mod tests {
             session_manager,
             scheduler: None,
         }
+    }
+
+    #[test]
+    fn best_catalog_match_prefers_exact_then_most_advanced_variant() {
+        let catalog = vec![
+            "claude-opus-4-8".to_string(),
+            "claude-opus-5".to_string(),
+            "claude-opus-5-5".to_string(),
+            "claude-sonnet-5-5".to_string(),
+        ];
+        assert_eq!(
+            super::SummonClient::best_catalog_match("opus", &catalog),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("claude-opus-5", &catalog),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("CLAUDE_OPUS_5", &catalog),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("haiku", &catalog),
+            None
+        );
+    }
+
+    #[test]
+    fn best_catalog_match_handles_version_qualified_family_names() {
+        let catalog = vec![
+            "gpt-5.6-luna".to_string(),
+            "gpt-6-luna".to_string(),
+            "gpt-5.4".to_string(),
+        ];
+        assert_eq!(
+            super::SummonClient::best_catalog_match("luna 5.6", &catalog),
+            Some("gpt-5.6-luna".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("luna-5.4", &catalog),
+            None
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("luna", &catalog),
+            Some("gpt-6-luna".to_string())
+        );
     }
 
     #[tokio::test]
@@ -3027,5 +3362,133 @@ You review code."#;
         assert!(error
             .to_string()
             .contains("No model configured for provider 'lmstudio'"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_params_model_overrides_recipe_model() {
+        let _env = env_lock::lock_env([
+            ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ("GOOSE_MAX_TOKENS", None::<&str>),
+            ("GOOSE_SUBAGENT_MODEL", None::<&str>),
+        ]);
+
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let mut recipe = empty_recipe();
+        recipe.settings = Some(crate::recipe::Settings {
+            goose_provider: None,
+            goose_model: Some("recipe-default-model".to_string()),
+            temperature: None,
+            max_turns: None,
+        });
+        let params = DelegateParams {
+            model: Some("explicit-override-model".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .resolve_model_config(
+                &params,
+                &recipe,
+                &session_with(parent_config()),
+                PROVIDER,
+                None,
+            )
+            .expect("resolve_model_config");
+        assert_eq!(
+            result.model_name, "explicit-override-model",
+            "params.model must take priority over recipe settings when GOOSE_SUBAGENT_MODEL is not set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_agent_recipe_preserves_provider() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let mut source = SourceEntry {
+            source_type: SourceType::Agent,
+            name: "test-agent".to_string(),
+            description: "A test agent".to_string(),
+            content: "Agent instructions".to_string(),
+            path: "/path/to/agent.md".to_string(),
+            global: false,
+            writable: true,
+            supporting_files: Vec::new(),
+            properties: HashMap::new(),
+        };
+        source.properties.insert(
+            "model".to_string(),
+            serde_json::Value::String("gpt-5.5".to_string()),
+        );
+
+        let params = DelegateParams {
+            provider: Some("gcp_vertex_ai".to_string()),
+            ..Default::default()
+        };
+
+        let recipe = client.build_recipe_from_agent(&source, &params).unwrap();
+        let settings = recipe.settings.unwrap();
+        assert_eq!(settings.goose_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            settings.goose_provider, None,
+            "agent recipe must not stamp params.provider as its own provider"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_google_routed_to_vertex_keeps_explicit_model() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let params = DelegateParams {
+            provider: Some("google".to_string()),
+            model: Some("gemini-3.8-flash".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .resolve_model_config(
+                &params,
+                &empty_recipe(),
+                &session_with(parent_config()),
+                "gcp_vertex_ai",
+                None,
+            )
+            .expect("resolve_model_config");
+        assert_eq!(
+            result.model_name, "gemini-3.8-flash",
+            "explicit model with provider 'google' must be preserved when auto-routed to 'gcp_vertex_ai'"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_model_config_provider_override_drops_unqualified_recipe_model() {
+        let client = SummonClient::new(create_test_context()).unwrap();
+        let mut recipe = empty_recipe();
+        recipe.settings = Some(crate::recipe::Settings {
+            goose_provider: None,
+            goose_model: Some("gpt-5.5".to_string()),
+            temperature: None,
+            max_turns: None,
+        });
+        let params = DelegateParams {
+            provider: Some("gcp_vertex_ai".to_string()),
+            model: None,
+            ..Default::default()
+        };
+        let session = crate::session::Session {
+            provider_name: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .resolve_model_config(
+                &params,
+                &recipe,
+                &session,
+                "gcp_vertex_ai",
+                Some("gemini-default"),
+            )
+            .expect("resolve_model_config");
+        assert_eq!(
+            result.model_name, "gemini-default",
+            "overriding provider without model must not pass incompatible unqualified recipe model"
+        );
     }
 }
