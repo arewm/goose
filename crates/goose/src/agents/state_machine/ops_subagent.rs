@@ -46,6 +46,18 @@ fn is_resume(subagent: &Session) -> bool {
     })
 }
 
+fn subagent_runtime(subagent: &Session) -> String {
+    let model = subagent
+        .model_config
+        .as_ref()
+        .map(|config| config.model_name.as_str())
+        .unwrap_or("unknown model");
+    match subagent.provider_name.as_deref() {
+        Some(provider) => format!(" ({provider} / {model})"),
+        None => format!(" ({model})"),
+    }
+}
+
 fn finished_notice(
     subagent_id: &str,
     outcome: &SubagentOutcome,
@@ -139,14 +151,15 @@ impl SubagentRunner<Session> for ForegroundSubagentRunner {
         {
             return ended(SubagentOutcome::Completed(output));
         }
+        let runtime = subagent_runtime(&subagent);
         let notice = if is_resume(&subagent) {
-            format!("Resuming subagent {subagent_session_id}")
+            format!("Resuming subagent {subagent_session_id}{runtime}")
         } else {
             let task = subagent
                 .recipe
                 .as_ref()
                 .and_then(|recipe| recipe.prompt.as_deref());
-            start_notice(subagent_session_id, task)
+            format!("{}{}", start_notice(subagent_session_id, task), runtime)
         };
         let notice = SubagentUpdate::ToParent(inline_notice(notice));
         Box::pin(stream::once(future::ready(notice)).chain(self.spawn(subagent, cancel)))
@@ -480,7 +493,7 @@ mod tests {
         assert_eq!(
             notices(&mut rx),
             vec![
-                format!("Running subagent {}", fixture.subagent_id),
+                format!("Running subagent {} (unknown model)", fixture.subagent_id),
                 format!("Subagent {} failed: {reason}", fixture.subagent_id),
             ]
         );
