@@ -13,6 +13,7 @@ use crate::recipe::{Recipe, RecipeParameter, Settings, RECIPE_FILE_EXTENSIONS};
 use crate::session::extension_data::EnabledExtensionsState;
 use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
+use crate::conversation::message::MessageContent;
 use crate::utils::safe_truncate;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -91,12 +92,21 @@ pub struct DelegateParams {
     pub r#async: bool,
 }
 
+
+#[derive(Debug, Clone)]
+pub struct ActiveToolInfo {
+    pub name: String,
+    pub summary: String,
+    pub started_at: Instant,
+}
+
 pub struct BackgroundTask {
     pub id: String,
     pub description: String,
     pub started_at: Instant,
     pub turns: Arc<AtomicU32>,
     pub last_activity: Arc<AtomicU64>,
+    pub active_tool: Arc<std::sync::Mutex<Option<ActiveToolInfo>>>,
     pub handle: JoinHandle<Result<String>>,
     pub cancellation_token: CancellationToken,
     completion_token: CancellationToken,
@@ -555,6 +565,31 @@ fn round_duration(d: Duration) -> String {
         format!("{}s", (secs / 10) * 10)
     } else {
         format!("{}m", secs / 60)
+    }
+}
+
+
+fn format_tool_summary(name: &str, arguments: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
+    let args_str = match arguments {
+        Some(map) => {
+            if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+                cmd.to_string()
+            } else if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
+                path.to_string()
+            } else if let Some(query) = map.get("query").and_then(|v| v.as_str()) {
+                query.to_string()
+            } else if let Some(source) = map.get("source").and_then(|v| v.as_str()) {
+                source.to_string()
+            } else {
+                serde_json::to_string(map).unwrap_or_default()
+            }
+        }
+        None => String::new(),
+    };
+    if args_str.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}: {}", name, safe_truncate(&args_str, 120))
     }
 }
 
@@ -1122,6 +1157,7 @@ impl SummonClient {
                 let elapsed = task.started_at.elapsed();
                 let turns = Arc::clone(&task.turns);
                 let last_activity = Arc::clone(&task.last_activity);
+                let active_tool = Arc::clone(&task.active_tool);
                 let description = task.description.clone();
                 let notification_sink = Arc::clone(&task.notification_sink);
 
@@ -1136,9 +1172,17 @@ impl SummonClient {
                     now.saturating_sub(last_activity_at)
                 };
                 let buffered_count = notification_sink.lock().await.buffered_len();
+                let current_tool = active_tool.lock().ok().and_then(|guard| guard.clone());
 
                 let mut output = format!(
-                    "# Background Task Status: {}\n\n**Task:** {}\n**Status:** ⏳ Running\n**Elapsed:** {}\n**Turns taken:** {}\n**Idle:** {}\n**Buffered tool calls:** {}",
+                    "# Background Task Status: {}
+
+**Task:** {}
+**Status:** ⏳ Running
+**Elapsed:** {}
+**Turns taken:** {}
+**Idle:** {}
+**Buffered tool calls:** {}",
                     task_id,
                     description,
                     round_duration(elapsed),
@@ -1147,8 +1191,17 @@ impl SummonClient {
                     buffered_count,
                 );
 
-                if buffered_count == 0 && last_activity_at == 0 {
-                    output.push_str("\n\n_Task is initialising (no tool activity yet)._");
+                if let Some(tool) = current_tool {
+                    output.push_str(&format!(
+                        "
+**Active tool:** {} (running for {})",
+                        tool.summary,
+                        round_duration(tool.started_at.elapsed()),
+                    ));
+                } else if buffered_count == 0 && last_activity_at == 0 {
+                    output.push_str("
+
+_Task is initialising (no tool activity yet)._");
                 }
 
                 return Ok(TaskLoadResult {
@@ -1165,10 +1218,11 @@ impl SummonClient {
                 Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
                 let task = running.remove(task_id).unwrap();
                 drop(running);
+                let cancelled_tool = task.active_tool.lock().ok().and_then(|guard| guard.clone());
                 task.cancellation_token.cancel();
 
                 let mut handle = task.handle;
-                let output = tokio::select! {
+                let raw_output = tokio::select! {
                     result = &mut handle => {
                         match result {
                             Ok(Ok(s)) => s,
@@ -1184,13 +1238,32 @@ impl SummonClient {
                 let duration = task.started_at.elapsed();
                 let turns_taken = self.refresh_task_turns(task_id, &task.turns).await;
 
+                let output = if raw_output.trim() == "No text content in last message" || raw_output.trim().is_empty() {
+                    if let Some(tool) = cancelled_tool {
+                        format!(
+                            "Task was cancelled while executing tool '{}' (running for {}).
+No final text response was generated before cancellation.",
+                            tool.summary,
+                            round_duration(tool.started_at.elapsed()),
+                        )
+                    } else {
+                        "Task was cancelled before generating a final response.".to_string()
+                    }
+                } else {
+                    raw_output
+                };
+
                 return Ok(TaskLoadResult {
                     content: vec![ContentBlock::text(format!(
-                        "# Background Task Result: {}\n\n\
-                         **Task:** {}\n\
-                         **Status:** ⊘ Cancelled\n\
-                         **Duration:** {} ({} turns)\n\n\
-                         ## Output\n\n{}",
+                        "# Background Task Result: {}
+
+                         **Task:** {}
+                         **Status:** ⊘ Cancelled
+                         **Duration:** {} ({} turns)
+
+                         ## Output
+
+{}",
                         task_id,
                         task.description,
                         round_duration(duration),
@@ -1202,9 +1275,6 @@ impl SummonClient {
                     duration_secs: Some(duration.as_secs()),
                 });
             }
-
-            // Wait for the running task to complete, keeping the tool call
-            // alive so notifications (subagent tool calls) stream in real time.
             let task = running.get(task_id).unwrap();
             let notification_sink = Arc::clone(&task.notification_sink);
             let completion_token = task.completion_token.clone();
@@ -2147,11 +2217,36 @@ impl SummonClient {
 
         let turns = Arc::new(AtomicU32::new(0));
         let last_activity = Arc::new(AtomicU64::new(0));
+        let active_tool = Arc::new(std::sync::Mutex::new(None::<ActiveToolInfo>));
 
         let last_activity_clone = Arc::clone(&last_activity);
+        let active_tool_clone = Arc::clone(&active_tool);
 
-        let on_message: OnMessageCallback = Arc::new(move |_msg| {
+        let on_message: OnMessageCallback = Arc::new(move |msg| {
             last_activity_clone.store(current_epoch_millis(), Ordering::Relaxed);
+            for block in &msg.content {
+                match block {
+                    MessageContent::ToolRequest(req) => {
+                        if let Ok(call) = &req.tool_call {
+                            let summary = format_tool_summary(&call.name, call.arguments.as_ref());
+                            let info = ActiveToolInfo {
+                                name: call.name.to_string(),
+                                summary,
+                                started_at: Instant::now(),
+                            };
+                            if let Ok(mut active) = active_tool_clone.lock() {
+                                *active = Some(info);
+                            }
+                        }
+                    }
+                    MessageContent::ToolResponse(_) => {
+                        if let Ok(mut active) = active_tool_clone.lock() {
+                                *active = None;
+                            }
+                    }
+                    _ => {}
+                }
+            }
         });
 
         let task_token = CancellationToken::new();
@@ -2185,6 +2280,7 @@ impl SummonClient {
             started_at: Instant::now(),
             turns,
             last_activity,
+            active_tool,
             handle,
             cancellation_token: task_token,
             completion_token,
@@ -2319,8 +2415,12 @@ impl McpClientTrait for SummonClient {
                 now.saturating_sub(last_activity_at)
             };
 
+            let active_summary = {
+                task.active_tool.try_lock().ok().and_then(|g| g.clone()).map(|t| format!(", active {}", t.summary))
+            }.unwrap_or_default();
+
             lines.push(format!(
-                "• {}: \"{}\" - running {}, {} turns, idle {}",
+                "• {}: \"{}\" - running {}, {} turns, idle {}{}",
                 task.id,
                 task.description,
                 round_duration(elapsed),
@@ -2329,6 +2429,7 @@ impl McpClientTrait for SummonClient {
                     .copied()
                     .unwrap_or_else(|| task.turns.load(Ordering::Relaxed)),
                 round_duration(Duration::from_millis(idle_ms)),
+                active_summary,
             ));
         }
 
@@ -3976,6 +4077,7 @@ You review code."#;
                     started_at: Instant::now(),
                     turns: Arc::new(AtomicU32::new(2)),
                     last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                     handle,
                     cancellation_token: CancellationToken::new(),
                     completion_token,
@@ -4127,6 +4229,7 @@ You review code."#;
                 // Simulate hundreds of streamed message events for two durable turns.
                 turns: Arc::new(AtomicU32::new(554)),
                 last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                 handle,
                 cancellation_token: CancellationToken::new(),
                 completion_token: CancellationToken::new(),
@@ -4245,6 +4348,7 @@ You review code."#;
                     // This stale event count must be replaced after cancellation.
                     turns: Arc::new(AtomicU32::new(3)),
                     last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                     handle: tokio::spawn(async move {
                         task_token.cancelled().await;
                         task_session_manager
@@ -4303,6 +4407,7 @@ You review code."#;
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
                 last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                 handle: tokio::spawn(async move {
                     task_token.cancelled().await;
                     Ok("cancelled gracefully".to_string())
@@ -4368,6 +4473,7 @@ You review code."#;
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
                 last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                 handle,
                 cancellation_token: CancellationToken::new(),
                 completion_token,
@@ -4443,6 +4549,7 @@ You review code."#;
                 started_at: Instant::now(),
                 turns: Arc::new(AtomicU32::new(1)),
                 last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                 handle,
                 cancellation_token: CancellationToken::new(),
                 completion_token,
@@ -4512,6 +4619,7 @@ You review code."#;
                     // Simulate the old stream-event counter after seven fragments.
                     turns: Arc::new(AtomicU32::new(7)),
                     last_activity: Arc::clone(&last_activity),
+                    active_tool: Arc::new(std::sync::Mutex::new(None)),
                     handle: tokio::spawn(async {
                         tokio::time::sleep(Duration::from_secs(1000)).await;
                         Ok("eventual result".to_string())
@@ -4618,5 +4726,87 @@ You review code."#;
             .await
             .unwrap();
         assert!(extract_text(&result.content[0]).contains("final output"));
+    }
+    #[tokio::test]
+    async fn test_peek_reports_active_tool_info() {
+        let task_id = "20260204_active";
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        let active_tool = Arc::new(std::sync::Mutex::new(Some(ActiveToolInfo {
+            name: "developer__shell".to_string(),
+            summary: "developer__shell: cargo test".to_string(),
+            started_at: Instant::now(),
+        })));
+
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            Ok("done".to_string())
+        });
+
+        client.background_tasks.lock().await.insert(
+            task_id.to_string(),
+            BackgroundTask {
+                id: task_id.to_string(),
+                description: "Running task with tool".to_string(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(1)),
+                last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                active_tool,
+                handle,
+                cancellation_token: CancellationToken::new(),
+                completion_token: CancellationToken::new(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let result = client
+            .handle_load_task_result(task_id, false, true, None)
+            .await
+            .unwrap();
+        let text = extract_text(&result.content[0]);
+        assert!(text.contains("**Active tool:** developer__shell: cargo test"));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_reports_cancelled_active_tool() {
+        let task_id = "20260204_cancel_tool";
+        let client = SummonClient::new(create_test_context()).unwrap();
+
+        let active_tool = Arc::new(std::sync::Mutex::new(Some(ActiveToolInfo {
+            name: "developer__shell".to_string(),
+            summary: "developer__shell: pytest".to_string(),
+            started_at: Instant::now(),
+        })));
+
+        let token = CancellationToken::new();
+        let task_token = token.clone();
+        let handle = tokio::spawn(async move {
+            task_token.cancelled().await;
+            Ok("No text content in last message".to_string())
+        });
+
+        client.background_tasks.lock().await.insert(
+            task_id.to_string(),
+            BackgroundTask {
+                id: task_id.to_string(),
+                description: "Cancellable task with tool".to_string(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(1)),
+                last_activity: Arc::new(AtomicU64::new(current_epoch_millis())),
+                active_tool,
+                handle,
+                cancellation_token: token,
+                completion_token: CancellationToken::new(),
+                notification_sink: buffered_notification_sink(Vec::new()),
+            },
+        );
+
+        let result = client
+            .handle_load_task_result(task_id, true, false, None)
+            .await
+            .unwrap();
+        let text = extract_text(&result.content[0]);
+        assert!(text.contains("Task was cancelled while executing tool \x27developer__shell: pytest\x27"));
+        assert!(text.contains("No final text response was generated before cancellation."));
     }
 }
