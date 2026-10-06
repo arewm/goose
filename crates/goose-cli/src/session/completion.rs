@@ -244,6 +244,8 @@ impl GooseCompleter {
             "/mode".to_string(),
             "/model".to_string(),
             "/new".to_string(),
+            "/review".to_string(),
+            "/pool-review".to_string(),
         ];
         commands.extend(
             list_commands()
@@ -704,6 +706,30 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].display, "/new");
         assert_eq!(candidates[0].replacement, "/new ");
+    }
+
+    #[test]
+    fn test_complete_slash_commands_review() {
+        let completer = GooseCompleter::new(create_test_cache());
+        for prefix in ["/rev", "/review"] {
+            let (pos, candidates) = completer.complete_slash_commands(prefix).unwrap();
+            assert_eq!(pos, 0);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].display, "/review");
+            assert_eq!(candidates[0].replacement, "/review ");
+        }
+    }
+
+    #[test]
+    fn test_complete_pool_review_command() {
+        let completer = GooseCompleter::new(create_test_cache());
+        for prefix in ["/pool-rev", "/pool-review"] {
+            let (pos, candidates) = completer.complete_slash_commands(prefix).unwrap();
+            assert_eq!(pos, 0);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].display, "/pool-review");
+            assert_eq!(candidates[0].replacement, "/pool-review ");
+        }
     }
 
     #[test]

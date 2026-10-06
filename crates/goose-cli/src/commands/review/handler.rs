@@ -6,14 +6,16 @@ use std::process::Command;
 use crate::session::{build_session, SessionBuilderConfig};
 
 use goose::checks::{discover, DiscoveredReview};
+use goose::config::Config;
 use goose::subprocess::git_command;
 
 use super::orchestrator::{
     emit_findings, run_checks_in_parallel, run_main_pass_in_parallel, Severity,
 };
 use super::prompt::{build_review_prompt, DEFAULT_REVIEW_PROMPT};
+use super::reviewer_pool::{load_pool, random_reviewer, resolve_provider_model, REVIEWER_POOL_KEY};
 
-/// Options for `goose review`.
+/// Options shared by `goose review` and the interactive `/review` command.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
     /// Diff range to review (e.g. `main...HEAD`). When `None`, falls back to
@@ -22,6 +24,12 @@ pub struct ReviewOptions {
     /// Path to a markdown file with a custom base review prompt. Overrides the
     /// embedded default prompt entirely.
     pub prompt_file: Option<PathBuf>,
+    /// Replace the built-in review guidance in normal review mode.
+    pub prompt_override: Option<String>,
+    /// Additional per-invocation focus for pool review mode.
+    pub pool_focus: Option<String>,
+    /// Whether this invocation uses the configured reviewer pool.
+    pub pool_only: bool,
     /// Default model used for the main review agent and for any check that
     /// does not declare its own `model:`.
     pub default_model: Option<String>,
@@ -46,9 +54,7 @@ pub struct ReviewOptions {
     /// reliably on its own. Checks with an explicit tool allowlist require
     /// the default orchestrator and are rejected on this path.
     pub no_orchestrate: bool,
-    /// Additional free-form instructions to prepend to the review (PR
-    /// intent, commit-message context, etc.). Surfaced to both the main
-    /// agent and every check subprocess.
+    /// Additional per-run context used by normal review.
     pub instructions: Option<String>,
     /// Restrict the review to a specific set of files (repo-relative).
     /// When non-empty, the diff sent to the agent is filtered to only
@@ -70,8 +76,22 @@ pub struct ReviewOptions {
     pub severity: String,
 }
 
-/// Entry point for the `goose review` subcommand.
+/// Run a standalone review without modifying an existing conversation.
+///
+/// Shared by `goose review` and interactive `/review`; results are printed directly
+/// to the terminal and errors are returned to the caller.
 pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
+    let config = Config::global();
+    let pool = if opts.pool_only {
+        load_pool(config)?
+    } else {
+        Vec::new()
+    };
+    if opts.pool_only && pool.is_empty() {
+        bail!(
+            "No reviewers configured in {REVIEWER_POOL_KEY}; add reviewer entries or use /review"
+        );
+    }
     let repo_root = find_repo_root().context("not inside a git repository")?;
     let untracked_root = opts
         .range
@@ -125,48 +145,85 @@ pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
         return Ok(());
     }
 
-    // `--check-scope` overrides where we look for `.agents/checks/*.md`,
-    // otherwise discovery walks from the repo root + every directory on
-    // the path of a touched file.
+    // Discovery is shared by both modes. Pool mode places these rules in the
+    // single reviewer prompt; normal mode dispatches checks as usual.
     let discovery_root = opts.check_scope.as_deref().unwrap_or(&repo_root);
-    // `touched` is repo-relative; rebase to discovery_root so candidate
-    // scope walking doesn't double-prefix `<scope>/api/...` for files
-    // already living under the scope.
     let discovery_touched = rebase_touched_to_scope(&repo_root, discovery_root, &touched);
     let discovered = discover(discovery_root, &discovery_touched)?;
-    let discovered = filter_checks(discovered, &opts.check_filter);
-    if !opts.quiet {
+    let discovered = if opts.pool_only {
+        discovered
+    } else {
+        filter_checks(discovered, &opts.check_filter)
+    };
+    if !opts.quiet && !opts.pool_only {
         print_discovered_summary(&discovered);
     }
 
-    let base_prompt = match &opts.prompt_file {
-        Some(path) => fs::read_to_string(path)
-            .with_context(|| format!("read --prompt file {}", path.display()))?,
-        None => DEFAULT_REVIEW_PROMPT.to_string(),
+    if opts.pool_only {
+        if opts.checks_only || opts.no_orchestrate {
+            anyhow::bail!(
+                "pool-only mode runs one reviewer over the whole diff; --checks-only and --no-orchestrate are not supported"
+            );
+        }
+        let reviewer = random_reviewer(&pool).expect("nonempty pool was checked");
+        let (provider, model) = resolve_provider_model(reviewer, &opts, config).await?;
+        eprintln!(
+            "goose review: selected reviewer '{}' (provider: {}, model: {})",
+            reviewer.name, provider, model
+        );
+        let base_prompt = if let Some(path) = &opts.prompt_file {
+            fs::read_to_string(path)
+                .with_context(|| format!("read --prompt file {}", path.display()))?
+        } else {
+            DEFAULT_REVIEW_PROMPT.to_string()
+        };
+        let check = reviewer.as_check(&base_prompt, &discovered, opts.pool_focus.as_deref());
+        let turns = check.resolved_turn_limit(opts.default_turn_limit);
+        if opts.dry_run {
+            println!(
+                "{}",
+                super::orchestrator::build_check_prompt(&check, &diff, None, turns, true,)
+            );
+            println!("\n# reviewer pool: exactly one tool-free dispatch for the whole diff");
+            return Ok(());
+        }
+        let findings = super::orchestrator::run_single_check_subprocess(
+            &check,
+            &diff,
+            Some(&provider),
+            Some(&model),
+            None,
+            Some(turns),
+            true,
+        )
+        .await?;
+        emit_findings(&findings, min_sev);
+        return Ok(());
+    }
+
+    let base_prompt = if let Some(text) = &opts.prompt_override {
+        text.clone()
+    } else {
+        match &opts.prompt_file {
+            Some(path) => fs::read_to_string(path)
+                .with_context(|| format!("read --prompt file {}", path.display()))?,
+            None => DEFAULT_REVIEW_PROMPT.to_string(),
+        }
     };
 
     let use_orchestrator = !opts.no_orchestrate;
-
-    // Reviewer instructions are also injected into every per-file
-    // main-pass subprocess and every per-check subprocess. To avoid
-    // duplicating them, only prepend to the base prompt for the legacy
-    // single-prompt (`--no-orchestrate`) path.
-    let base_prompt = if use_orchestrator {
-        base_prompt
-    } else {
-        prepend_instructions(&base_prompt, opts.instructions.as_deref())
-    };
-
-    // In orchestrator mode, the main pass runs as N parallel subprocesses
-    // (one per touched file) — checks run as parallel subprocesses too —
-    // so the assembled prompt only matters for the legacy in-process path.
     let main_prompt_discovered = if use_orchestrator {
         DiscoveredReview::default()
     } else {
         discovered.clone()
     };
+    let prompt_base = if use_orchestrator {
+        base_prompt.as_str().to_owned()
+    } else {
+        prepend_instructions(&base_prompt, opts.instructions.as_deref())
+    };
     let prompt = build_review_prompt(
-        &base_prompt,
+        &prompt_base,
         &main_prompt_discovered,
         &diff,
         opts.default_model.as_deref(),
@@ -187,14 +244,7 @@ pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
     }
 
     if !use_orchestrator {
-        // Legacy in-process path (--no-orchestrate). Useful for comparing
-        // against orchestrated wall clock and for models that handle
-        // delegation reliably on their own.
         if opts.checks_only {
-            // The legacy path runs everything as a single agent prompt,
-            // so it has no way to "skip the main pass". Fall back to the
-            // orchestrator's check-runner (which IS able to run checks
-            // in isolation) instead of silently no-op'ing.
             let check_results = run_checks_in_parallel(&discovered.checks, &diff, &opts).await;
             let mut total_emitted = 0usize;
             let mut total_seen = 0usize;
@@ -228,11 +278,6 @@ pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
         return session.headless(prompt).await;
     }
 
-    // Orchestrated mode: run the main correctness pass (per-file
-    // parallel subprocesses) and the discovered checks (one subprocess
-    // each, capped at MAX_WORKERS) concurrently. Wall clock is bounded
-    // by `max(slowest_main_file, slowest_check)` instead of scaling
-    // with diff size or check count.
     let main_findings_fut = async {
         if opts.checks_only {
             Vec::new()
@@ -305,19 +350,10 @@ fn ensure_legacy_check_tools_are_unrestricted(discovered: &DiscoveredReview) -> 
     )
 }
 
-/// Prepend a free-form `--instructions <text>` block to the base prompt
-/// so it is visible to both the main agent and (via the orchestrator)
-/// every per-check subprocess.
 fn prepend_instructions(base_prompt: &str, instructions: Option<&str>) -> String {
-    match instructions {
-        Some(text) if !text.trim().is_empty() => {
-            format!(
-                "## Reviewer instructions\n\n{}\n\n{}",
-                text.trim(),
-                base_prompt
-            )
-        }
-        _ => base_prompt.to_string(),
+    match instructions.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("## Reviewer instructions\n\n{text}\n\n{base_prompt}"),
+        None => base_prompt.to_string(),
     }
 }
 
@@ -364,23 +400,17 @@ fn review_git_command(repo_root: &Path) -> Command {
     cmd
 }
 
+fn add_diff_revision_and_paths(cmd: &mut Command, range: Option<&str>, files: &[String]) {
+    cmd.arg("--end-of-options")
+        .arg(range.unwrap_or("HEAD"))
+        .arg("--")
+        .args(files);
+}
+
 fn touched_files(repo_root: &Path, range: Option<&str>, files: &[String]) -> Result<Vec<String>> {
     let mut cmd = review_git_command(repo_root);
     cmd.arg("diff").arg("--no-ext-diff").arg("--name-only");
-    match range {
-        Some(r) => {
-            cmd.arg(r);
-        }
-        None => {
-            cmd.arg("HEAD");
-        }
-    }
-    if !files.is_empty() {
-        cmd.arg("--");
-        for f in files {
-            cmd.arg(f);
-        }
-    }
+    add_diff_revision_and_paths(&mut cmd, range, files);
     let out = cmd.output().context("git diff --name-only failed")?;
     if !out.status.success() {
         bail!(
@@ -398,20 +428,7 @@ fn touched_files(repo_root: &Path, range: Option<&str>, files: &[String]) -> Res
 fn collect_diff(repo_root: &Path, range: Option<&str>, files: &[String]) -> Result<String> {
     let mut cmd = review_git_command(repo_root);
     cmd.arg("diff").arg("--no-ext-diff");
-    match range {
-        Some(r) => {
-            cmd.arg(r);
-        }
-        None => {
-            cmd.arg("HEAD");
-        }
-    }
-    if !files.is_empty() {
-        cmd.arg("--");
-        for f in files {
-            cmd.arg(f);
-        }
-    }
+    add_diff_revision_and_paths(&mut cmd, range, files);
     let out = cmd.output().context("git diff failed")?;
     if !out.status.success() {
         bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -422,20 +439,7 @@ fn collect_diff(repo_root: &Path, range: Option<&str>, files: &[String]) -> Resu
 fn collect_diff_stat(repo_root: &Path, range: Option<&str>, files: &[String]) -> Result<String> {
     let mut cmd = review_git_command(repo_root);
     cmd.arg("diff").arg("--no-ext-diff").arg("--stat");
-    match range {
-        Some(r) => {
-            cmd.arg(r);
-        }
-        None => {
-            cmd.arg("HEAD");
-        }
-    }
-    if !files.is_empty() {
-        cmd.arg("--");
-        for f in files {
-            cmd.arg(f);
-        }
-    }
+    add_diff_revision_and_paths(&mut cmd, range, files);
     let out = cmd.output().context("git diff --stat failed")?;
     if !out.status.success() {
         bail!(
@@ -1144,6 +1148,32 @@ mod tests {
         open_untracked_root(&path)
     }
 
+    fn init_review_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Review Test"]);
+        run_git(&["config", "user.email", "review-test@example.com"]);
+        fs::write(dir.path().join("changed.txt"), "before\n").unwrap();
+        run_git(&["add", "changed.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+        fs::write(dir.path().join("changed.txt"), "after\n").unwrap();
+        fs::write(dir.path().join("HEAD"), "a path that collides with the revision\n").unwrap();
+        dir
+    }
+
     fn ck(name: &str) -> Check {
         Check {
             name: name.to_string(),
@@ -1156,6 +1186,31 @@ mod tests {
             scope_dir: String::new(),
             body: "body".into(),
         }
+    }
+
+    #[test]
+    fn default_diff_includes_revision_path_named_head() {
+        let dir = init_review_git_repo();
+
+        let touched = touched_files(dir.path(), None, &[]).unwrap();
+        let diff = collect_diff(dir.path(), None, &[]).unwrap();
+        let stat = collect_diff_stat(dir.path(), None, &[]).unwrap();
+
+        assert!(touched.contains(&"changed.txt".to_string()));
+        assert!(diff.contains("+after"));
+        assert!(stat.contains("changed.txt"));
+    }
+
+    #[test]
+    fn diff_range_cannot_be_parsed_as_git_options() {
+        let dir = init_review_git_repo();
+        let sentinel = dir.path().join("output-sentinel");
+        let output_range = format!("--output={}", sentinel.display());
+
+        assert!(touched_files(dir.path(), Some(&output_range), &[]).is_err());
+        assert!(collect_diff(dir.path(), Some(&output_range), &[]).is_err());
+        assert!(collect_diff_stat(dir.path(), Some(&output_range), &[]).is_err());
+        assert!(!sentinel.exists());
     }
 
     #[test]
@@ -1209,19 +1264,6 @@ mod tests {
 
         let error = ensure_legacy_check_tools_are_unrestricted(&discovered).unwrap_err();
         assert!(error.to_string().contains("no-tools"));
-    }
-
-    #[test]
-    fn prepend_instructions_noop_when_none_or_empty() {
-        assert_eq!(prepend_instructions("BASE", None), "BASE");
-        assert_eq!(prepend_instructions("BASE", Some("   ")), "BASE");
-    }
-
-    #[test]
-    fn prepend_instructions_adds_block_above_base() {
-        let out = prepend_instructions("BASE", Some("Refactor only — flag any behavior change."));
-        assert!(out.starts_with("## Reviewer instructions\n\nRefactor only"));
-        assert!(out.ends_with("BASE"));
     }
 
     #[cfg(any(unix, windows))]

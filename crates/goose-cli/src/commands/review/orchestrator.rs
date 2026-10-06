@@ -112,6 +112,7 @@ pub async fn run_checks_in_parallel(
                 model.as_deref(),
                 instructions.as_deref(),
                 Some(max_turns),
+                true,
             )
             .await;
             (idx, check, result, quiet)
@@ -189,22 +190,24 @@ fn resolve_main_turn_limit(default_turn_limit: Option<usize>) -> usize {
 
 /// Spawn a single `goose run` subprocess for one check and parse its
 /// output into [`Finding`]s.
-async fn run_single_check_subprocess(
+pub(super) async fn run_single_check_subprocess(
     check: &Check,
     diff: &str,
     provider: Option<&str>,
     model: Option<&str>,
     instructions: Option<&str>,
     max_turns: Option<usize>,
+    tool_free: bool,
 ) -> Result<Vec<Finding>> {
     let turns = max_turns.expect("check subprocess always has a resolved turn limit");
-    let prompt = build_check_prompt(check, diff, instructions, turns);
+    let prompt = build_check_prompt(check, diff, instructions, turns, tool_free);
     let raw = run_subprocess_for_findings(
         &prompt,
         &format!("check '{}'", check.name),
         provider,
         model,
         max_turns,
+        tool_free,
     )
     .await?;
     let default_sev = check.severity_default.as_deref().unwrap_or("medium");
@@ -231,32 +234,11 @@ async fn run_subprocess_for_findings(
     provider: Option<&str>,
     model: Option<&str>,
     max_turns: Option<usize>,
+    tool_free: bool,
 ) -> Result<Vec<RawFinding>> {
     let goose_bin = std::env::current_exe().context("locate current goose binary")?;
 
-    let mut cmd = Command::new(&goose_bin);
-    cmd.arg("run")
-        .arg("--no-session")
-        .arg("--quiet")
-        .arg("--no-profile")
-        .arg("-i")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // If this future is dropped, kill the child so it does not keep
-        // running (and racking up tokens) in the background.
-        .kill_on_drop(true);
-
-    if let Some(p) = provider {
-        cmd.arg("--provider").arg(p);
-    }
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    if let Some(t) = max_turns {
-        cmd.arg("--max-turns").arg(t.to_string());
-    }
+    let mut cmd = findings_command(&goose_bin, provider, model, max_turns, tool_free);
 
     let mut child = cmd
         .spawn()
@@ -287,6 +269,44 @@ async fn run_subprocess_for_findings(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     parse_findings(&stdout)
+}
+
+fn findings_command(
+    goose_bin: &std::path::Path,
+    provider: Option<&str>,
+    model: Option<&str>,
+    max_turns: Option<usize>,
+    tool_free: bool,
+) -> Command {
+    let mut cmd = Command::new(goose_bin);
+    cmd.arg("run")
+        .arg("--no-session")
+        .arg("--quiet")
+        .arg("--no-profile");
+    if tool_free {
+        cmd.env("GOOSE_MODE", "chat");
+        cmd.env("GOOSE_DISABLE_KEYRING", "true");
+    }
+    cmd.arg("-i")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // If this future is dropped, kill the child so it does not keep
+        // running (and racking up tokens) in the background.
+        .kill_on_drop(true);
+
+    if let Some(p) = provider {
+        cmd.arg("--provider").arg(p);
+    }
+    if let Some(m) = model {
+        cmd.arg("--model").arg(m);
+    }
+    if let Some(t) = max_turns {
+        cmd.arg("--max-turns").arg(t.to_string());
+    }
+
+    cmd
 }
 
 /// Run the main correctness pass as N parallel subprocesses, one per
@@ -344,6 +364,7 @@ pub async fn run_main_pass_in_parallel(
                 provider.as_deref(),
                 model.as_deref(),
                 Some(max_turns),
+                false,
             )
             .await;
             (idx, path, result, quiet)
@@ -630,14 +651,19 @@ fn build_main_pass_prompt(
 /// Shape matches the prompt format Amp-authored checks already expect,
 /// so a check written for `amp review` runs the same way under
 /// `goose review`.
-fn build_check_prompt(
+pub(super) fn build_check_prompt(
     check: &Check,
     diff: &str,
     instructions: Option<&str>,
     max_turns: usize,
+    tool_free: bool,
 ) -> String {
     let mut s = String::new();
-    s.push_str("You are running an automated code review check.\n\n");
+    if tool_free {
+        s.push_str("You are a single, tool-free code reviewer. You cannot delegate or run tools. Review only the supplied complete diff.\n\n");
+    } else {
+        s.push_str("You are running an automated code review check.\n\n");
+    }
     s.push_str(&format!("Check name: {}\n", check.name));
     if let Some(d) = check.description.as_deref() {
         if !d.is_empty() {
@@ -672,10 +698,17 @@ fn build_check_prompt(
     );
     s.push_str("Report issues ONLY for code that was added or modified in this diff.\n");
     s.push_str("Do NOT report issues for unchanged/pre-existing code shown for context.\n\n");
-    s.push_str(
-        "Return ONLY valid JSON with this exact schema:\n\
+    if tool_free {
+        s.push_str(
+            "Return ONLY valid JSON with this exact schema:\n\
 {\n  \"findings\": [\n    {\n      \"severity\": \"low|medium|high|critical\",\n      \"path\": \"relative/path/to/file\",\n      \"line_start\": 10,\n      \"line_end\": 12,\n      \"summary\": \"One-sentence actionable issue\"\n    }\n  ]\n}\n\nIf there are no issues, return:\n{\"findings\":[]}\n\nDo NOT include any text before or after the JSON. Do NOT wrap the JSON in code fences.\n\n",
-    );
+        );
+    } else {
+        s.push_str(
+            "Return ONLY valid JSON with this exact schema:\n\\
+{\n  \"findings\": [\n    {\n      \"severity\": \"low|medium|high|critical\",\n      \"path\": \"relative/path/to/file\",\n      \"line_start\": 10,\n      \"line_end\": 12,\n      \"summary\": \"One-sentence actionable issue\"\n    }\n  ]\n}\n\nIf there are no issues, return:\n{\"findings\":[]}\n\nDo NOT include any text before or after the JSON. Do NOT wrap the JSON in code fences.\n\n",
+        );
+    }
     s.push_str("Check instructions:\n\n");
     s.push_str(check.body.trim());
     s.push_str("\n\nDiff:\n\n```diff\n");
@@ -830,6 +863,67 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn reviewer_subprocess_is_tool_free_and_pins_execution_settings() {
+        let command = findings_command(
+            std::path::Path::new("goose"),
+            Some("review-provider"),
+            Some("review-model"),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == "GOOSE_MODE")
+                .map(|(_, value)| value.unwrap().to_str().unwrap()),
+            Some("chat")
+        );
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--no-session",
+                "--quiet",
+                "--no-profile",
+                "-i",
+                "-",
+                "--provider",
+                "review-provider",
+                "--model",
+                "review-model",
+                "--max-turns",
+                "7"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewer_without_extensions_has_no_delegation_tools() {
+        let _mode = env_lock::lock_env([
+            ("GOOSE_MODE", Some("chat")),
+            ("GOOSE_DISABLE_KEYRING", Some("true")),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let manager = goose::agents::extension_manager::ExtensionManager::new_without_provider(
+            dir.path().to_path_buf(),
+        );
+        let tools = manager
+            .get_prefixed_tools("reviewer-without-extensions", None)
+            .await
+            .unwrap();
+        assert!(
+            tools.is_empty(),
+            "review subprocesses without profile/extensions must not expose delegation tools"
+        );
+    }
+
     fn ck(name: &str) -> Check {
         Check {
             name: name.to_string(),
@@ -846,7 +940,13 @@ mod tests {
 
     #[test]
     fn check_prompt_is_strict_and_diff_aware() {
-        let p = build_check_prompt(&ck("perf"), "diff content", None, DEFAULT_CHECK_TURN_LIMIT);
+        let p = build_check_prompt(
+            &ck("perf"),
+            "diff content",
+            None,
+            DEFAULT_CHECK_TURN_LIMIT,
+            false,
+        );
         assert!(p.contains("automated code review check"));
         assert!(p.contains("Check name: perf"));
         assert!(p.contains("```diff\ndiff content\n```"));
@@ -859,7 +959,13 @@ mod tests {
     fn check_prompt_restricts_findings_to_added_or_modified_lines() {
         // Mirrors Amp's prompt language; without these the model
         // happily flags pre-existing code shown for context.
-        let p = build_check_prompt(&ck("perf"), "diff content", None, DEFAULT_CHECK_TURN_LIMIT);
+        let p = build_check_prompt(
+            &ck("perf"),
+            "diff content",
+            None,
+            DEFAULT_CHECK_TURN_LIMIT,
+            false,
+        );
         assert!(p.contains("ONLY in the changed lines"));
         assert!(p.contains("lines beginning with `+`"));
         assert!(p.contains("ONLY for code that was added or modified"));
@@ -873,6 +979,7 @@ mod tests {
             "diff content",
             Some("This is a refactor; flag any behavior change."),
             DEFAULT_CHECK_TURN_LIMIT,
+            false,
         );
         assert!(p.contains("Reviewer instructions:"));
         assert!(p.contains("flag any behavior change"));
@@ -885,13 +992,14 @@ mod tests {
             "diff content",
             Some("   \n  "),
             DEFAULT_CHECK_TURN_LIMIT,
+            false,
         );
         assert!(!p.contains("Reviewer instructions"));
     }
 
     #[test]
     fn check_prompt_includes_turn_budget() {
-        let p = build_check_prompt(&ck("perf"), "diff content", None, 12);
+        let p = build_check_prompt(&ck("perf"), "diff content", None, 12, false);
         assert!(p.contains("## Turn budget"));
         assert!(p.contains("at most 12 agent turns"));
         assert!(p.contains("--max-turns"));
