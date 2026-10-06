@@ -734,6 +734,12 @@ impl CliSession {
                 history.save(editor);
                 self.handle_compact().await?;
             }
+            InputResult::Review(instructions) => {
+                history.save(editor);
+                if let Err(error) = self.handle_review(instructions).await {
+                    output::render_error(&format!("Review failed: {error:#}"));
+                }
+            }
             InputResult::Edit(prefill) => {
                 history.save(editor);
                 match crate::session::editor::resolve_editor_command() {
@@ -775,6 +781,28 @@ impl CliSession {
             }
         }
         Ok(())
+    }
+
+    async fn review_options(
+        &self,
+        instructions: Option<String>,
+    ) -> Result<crate::commands::review::ReviewOptions> {
+        let provider = self.agent.provider().await?;
+        let model_config = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await?;
+        Ok(crate::commands::review::ReviewOptions {
+            provider: Some(provider.get_name().to_string()),
+            default_model: Some(model_config.model_name),
+            instructions,
+            ..Default::default()
+        })
+    }
+
+    async fn handle_review(&self, instructions: Option<String>) -> Result<()> {
+        let options = self.review_options(instructions).await?;
+        crate::commands::review::handle_review(options).await
     }
 
     async fn handle_message_input(
@@ -3241,6 +3269,41 @@ mod tests {
             extension_loading,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn review_uses_session_provider_and_model_without_changing_conversation() {
+        let session = session_with_loader(None, false).await;
+        let instructions = Some("Focus on security".to_string());
+        let options = session.review_options(instructions.clone()).await.unwrap();
+        assert_eq!(options.provider.as_deref(), Some("stub"));
+        assert_eq!(options.default_model.as_deref(), Some("stub-model"));
+        assert_eq!(options.instructions, instructions);
+        assert!(options.range.is_none());
+        assert!(options.prompt_file.is_none());
+        assert!(options.override_model.is_none());
+        assert!(!options.no_orchestrate);
+        assert!(!options.checks_only);
+        assert!(!options.dry_run);
+        assert!(session.messages.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_errors_return_control_to_session() {
+        let mut session = session_with_loader(None, false).await;
+        session.agent = Arc::new(Agent::with_config(session.agent.config.clone()));
+        assert!(session.review_options(None).await.is_err());
+        let history_dir = tempfile::tempdir().unwrap();
+        let history = HistoryManager {
+            history_file: history_dir.path().join("history.txt"),
+            old_history_file: history_dir.path().join("old-history.txt"),
+        };
+        let mut editor = session.create_editor().unwrap();
+        session
+            .handle_input(InputResult::Review(None), &history, &mut editor, &[])
+            .await
+            .unwrap();
+        assert!(session.messages.messages().is_empty());
     }
 
     #[tokio::test]
