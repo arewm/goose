@@ -2976,6 +2976,48 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Term { command }) => handle_term_subcommand(command).await,
         #[cfg(feature = "local-inference")]
         Some(Command::LocalModels { command }) => handle_local_models_command(command).await,
+        Some(Command::Review {
+            range,
+            prompt,
+            model,
+            provider,
+            override_model,
+            turn_limit,
+            dry_run,
+            quiet,
+            no_orchestrate,
+            instructions,
+            files,
+            check_filter,
+            check_scope,
+            checks_only,
+            summary_only,
+            severity,
+        }) => {
+            use crate::commands::review::{handle_review, ReviewOptions};
+            handle_review(ReviewOptions {
+                range,
+                prompt_file: prompt,
+                prompt_override: None,
+                pool_focus: None,
+                pool_only: false,
+                default_model: model,
+                provider,
+                override_model,
+                default_turn_limit: turn_limit,
+                dry_run,
+                quiet,
+                no_orchestrate,
+                instructions,
+                files,
+                check_filter,
+                check_scope,
+                checks_only,
+                summary_only,
+                severity,
+            })
+            .await
+        }
         Some(Command::ValidateExtensions { file }) => {
             use goose::agents::validate_extensions::validate_bundled_extensions;
             match validate_bundled_extensions(&file) {

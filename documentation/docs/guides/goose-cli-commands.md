@@ -487,6 +487,76 @@ goose run --recipe recipe.yaml --max-turns 10
 
 ---
 
+#### review [options] [range]
+Review the current git diff using goose. By default, `goose review` reviews the working tree against `HEAD`; pass a range such as `main...HEAD` to review a specific diff.
+
+`goose review` can discover review checks from `.agents/checks/*.md` and scoped review instructions from `.agents/REVIEW.md`.
+
+To use a configured reviewer pool instead, add explicit entries to `~/.config/goose/config.yaml`:
+
+```yaml
+GOOSE_REVIEWER_POOL:
+  - name: anthropic-review
+    provider: anthropic
+    model: claude-opus-4-8
+  - name: openai-review
+    provider: openai
+    model: gpt-6.1-sol
+  - name: vertex-flash-review
+    provider: gcp_vertex_ai
+    model: gemini-3.8-flash
+```
+
+`/review [text]` runs the normal review workflow: the main review plus discovered checks from
+`.agents/checks/*.md` and applicable `.agents/REVIEW.md` files. `/pool-review [text]` instead picks
+one model/provider uniformly at random and sends it the full diff in one review request. In pool
+mode, applicable check and `REVIEW.md` contents are included as guidance in that request; they are
+not dispatched as separate agents. The configured pool entries contain a unique `name` and
+optional `provider` and `model` only. An absent or empty pool makes `/pool-review` report a clear
+configuration error; malformed entries also fail before review dispatch.
+
+With `/review`, optional `text` replaces the built-in base prompt; the normal review process and discovered checks still apply. With `/pool-review`, optional `text` adds focus to the built-in review guidance. Repository rules, scope, and the structured findings contract always remain.
+
+**Options:**
+- **`--prompt <FILE>`**: Use a custom base review prompt
+- **`--model <MODEL>`**: Set the default model for the main review agent and checks that do not declare their own model
+- **`--provider <PROVIDER>`**: Set the provider for the main review agent
+- **`--override-model <MODEL>`**: Force every discovered check to use this model
+- **`--turn-limit <N>`**: Set the default turn limit for orchestrated review subprocesses and checks
+- **`--dry-run`**: Print the assembled review prompt and discovered checks without running the review
+- **`-q, --quiet`**: Suppress non-result output from the underlying agent
+- **`--no-orchestrate`**: Disable the default Rust-driven parallel orchestrator and use the single-prompt path. Checks that declare `tools` are rejected because this path cannot enforce per-check tool allowlists.
+- **`-i, --instructions <TEXT>`**: Add free-form review instructions
+- **`-f, --files <FILE>...`**: Restrict the review to specific files
+- **`-c, --check-filter <NAME>...`**: Run only checks with matching names
+- **`-s, --check-scope <DIR>`**: Search a specific directory for `.agents/checks/*.md`
+- **`--checks-only`**: Skip the main correctness pass and run only check subagents
+- **`--summary-only`**: Print only the diff summary
+- **`--severity <LEVEL>`**: Minimum severity to display. Defaults to `medium`; use `low` to show every finding
+
+**Usage:**
+```bash
+# Review the working tree against HEAD
+goose review
+
+# Review a branch range
+goose review main...HEAD
+
+# Add review intent
+goose review --instructions "This is a refactor; flag behavior changes"
+
+# Review only selected files
+goose review --files crates/goose/src/agents/agent.rs documentation/docs/guides/goose-cli-commands.md
+
+# Preview the assembled prompt and discovered checks
+goose review --dry-run
+
+# Run only named checks
+goose review --check-filter security performance --checks-only
+```
+
+---
+
 #### recipe
 Used to validate recipe files, manage recipe sharing, list available recipes, and open recipes in goose desktop.
 
@@ -781,6 +851,8 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/prompt <n> [--info] [key=value...]`** - Get prompt info or execute a prompt
 - **`/prompts [--extension <name>]`** - List all available prompts, optionally filtered by extension
 - **`/compact`** - Compact and summarize the current conversation to reduce context length while preserving key information
+- **`/review [text]`** - Run the normal review workflow on current local changes, including discovered checks and `REVIEW.md` rules; optional text replaces the default review guidance
+- **`/pool-review [text]`** - Run one randomly selected reviewer from `GOOSE_REVIEWER_POOL`; optional text adds focus while repository review rules are included
 - **`/r`** - Toggle full tool output display (show complete tool parameters without truncation)
 - **`/skills [<name>...]`** - List available skills, or load one or more skills by name
 - **`/status`** - Show the current session ID, model, provider, mode, and token usage. Use the ID to resume the same session in another client, or with `goose session --resume --session-id <session_id>` in the CLI.
