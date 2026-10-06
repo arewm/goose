@@ -13,7 +13,7 @@ use super::orchestrator::{
 };
 use super::prompt::{build_review_prompt, DEFAULT_REVIEW_PROMPT};
 
-/// Options for `goose review`.
+/// Options shared by `goose review` and the interactive `/review` command.
 #[derive(Debug, Clone, Default)]
 pub struct ReviewOptions {
     /// Diff range to review (e.g. `main...HEAD`). When `None`, falls back to
@@ -70,7 +70,10 @@ pub struct ReviewOptions {
     pub severity: String,
 }
 
-/// Entry point for the `goose review` subcommand.
+/// Run a standalone review without modifying an existing conversation.
+///
+/// Shared by `goose review` and interactive `/review`; results are printed directly
+/// to the terminal and errors are returned to the caller.
 pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
     let repo_root = find_repo_root().context("not inside a git repository")?;
     let untracked_root = opts
@@ -364,23 +367,17 @@ fn review_git_command(repo_root: &Path) -> Command {
     cmd
 }
 
+fn add_diff_revision_and_paths(cmd: &mut Command, range: Option<&str>, files: &[String]) {
+    cmd.arg("--end-of-options")
+        .arg(range.unwrap_or("HEAD"))
+        .arg("--")
+        .args(files);
+}
+
 fn touched_files(repo_root: &Path, range: Option<&str>, files: &[String]) -> Result<Vec<String>> {
     let mut cmd = review_git_command(repo_root);
     cmd.arg("diff").arg("--no-ext-diff").arg("--name-only");
-    match range {
-        Some(r) => {
-            cmd.arg(r);
-        }
-        None => {
-            cmd.arg("HEAD");
-        }
-    }
-    if !files.is_empty() {
-        cmd.arg("--");
-        for f in files {
-            cmd.arg(f);
-        }
-    }
+    add_diff_revision_and_paths(&mut cmd, range, files);
     let out = cmd.output().context("git diff --name-only failed")?;
     if !out.status.success() {
         bail!(
@@ -398,20 +395,7 @@ fn touched_files(repo_root: &Path, range: Option<&str>, files: &[String]) -> Res
 fn collect_diff(repo_root: &Path, range: Option<&str>, files: &[String]) -> Result<String> {
     let mut cmd = review_git_command(repo_root);
     cmd.arg("diff").arg("--no-ext-diff");
-    match range {
-        Some(r) => {
-            cmd.arg(r);
-        }
-        None => {
-            cmd.arg("HEAD");
-        }
-    }
-    if !files.is_empty() {
-        cmd.arg("--");
-        for f in files {
-            cmd.arg(f);
-        }
-    }
+    add_diff_revision_and_paths(&mut cmd, range, files);
     let out = cmd.output().context("git diff failed")?;
     if !out.status.success() {
         bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -422,20 +406,7 @@ fn collect_diff(repo_root: &Path, range: Option<&str>, files: &[String]) -> Resu
 fn collect_diff_stat(repo_root: &Path, range: Option<&str>, files: &[String]) -> Result<String> {
     let mut cmd = review_git_command(repo_root);
     cmd.arg("diff").arg("--no-ext-diff").arg("--stat");
-    match range {
-        Some(r) => {
-            cmd.arg(r);
-        }
-        None => {
-            cmd.arg("HEAD");
-        }
-    }
-    if !files.is_empty() {
-        cmd.arg("--");
-        for f in files {
-            cmd.arg(f);
-        }
-    }
+    add_diff_revision_and_paths(&mut cmd, range, files);
     let out = cmd.output().context("git diff --stat failed")?;
     if !out.status.success() {
         bail!(
@@ -1144,6 +1115,32 @@ mod tests {
         open_untracked_root(&path)
     }
 
+    fn init_review_git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Review Test"]);
+        run_git(&["config", "user.email", "review-test@example.com"]);
+        fs::write(dir.path().join("changed.txt"), "before\n").unwrap();
+        run_git(&["add", "changed.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+        fs::write(dir.path().join("changed.txt"), "after\n").unwrap();
+        fs::write(dir.path().join("HEAD"), "a path that collides with the revision\n").unwrap();
+        dir
+    }
+
     fn ck(name: &str) -> Check {
         Check {
             name: name.to_string(),
@@ -1156,6 +1153,31 @@ mod tests {
             scope_dir: String::new(),
             body: "body".into(),
         }
+    }
+
+    #[test]
+    fn default_diff_includes_revision_path_named_head() {
+        let dir = init_review_git_repo();
+
+        let touched = touched_files(dir.path(), None, &[]).unwrap();
+        let diff = collect_diff(dir.path(), None, &[]).unwrap();
+        let stat = collect_diff_stat(dir.path(), None, &[]).unwrap();
+
+        assert!(touched.contains(&"changed.txt".to_string()));
+        assert!(diff.contains("+after"));
+        assert!(stat.contains("changed.txt"));
+    }
+
+    #[test]
+    fn diff_range_cannot_be_parsed_as_git_options() {
+        let dir = init_review_git_repo();
+        let sentinel = dir.path().join("output-sentinel");
+        let output_range = format!("--output={}", sentinel.display());
+
+        assert!(touched_files(dir.path(), Some(&output_range), &[]).is_err());
+        assert!(collect_diff(dir.path(), Some(&output_range), &[]).is_err());
+        assert!(collect_diff_stat(dir.path(), Some(&output_range), &[]).is_err());
+        assert!(!sentinel.exists());
     }
 
     #[test]

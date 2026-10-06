@@ -27,6 +27,7 @@ pub enum InputResult {
     Clear,
     New,
     Compact,
+    Review(Option<String>),
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -236,6 +237,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
+    const CMD_REVIEW: &str = "/review";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -324,6 +326,15 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s == CMD_NEW => Some(InputResult::New),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
+        s if s == CMD_REVIEW
+            || s.strip_prefix(CMD_REVIEW)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace)) =>
+        {
+            let instructions = s[CMD_REVIEW.len()..].trim();
+            Some(InputResult::Review(
+                (!instructions.is_empty()).then(|| instructions.to_string()),
+            ))
+        }
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -432,6 +443,7 @@ fn help_text() -> String {
 /model [name] - Show the current model, or switch models for this session while keeping the same provider
 /model --provider <name> [model] - Switch to a different provider (optionally specifying a model)
 /compact - Compact the current conversation to reduce context length while preserving key information.
+/review [instructions] - Review local changes using the current provider and model, then return to the session.
 {additional_builtin_help}/status - Show session status: model, provider, mode, and token usage.
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
@@ -493,6 +505,31 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_review_command() {
+        for (input, expected) in [
+            ("/review", None),
+            ("  /review  ", None),
+            ("/review focus on security", Some("focus on security")),
+            ("/review   keep  spacing  ", Some("keep  spacing")),
+            ("/review\tfocus on tests", Some("focus on tests")),
+            ("/review --range main", Some("--range main")),
+            (
+                "/review \"quoted\"\nsecond line",
+                Some("\"quoted\"\nsecond line"),
+            ),
+        ] {
+            let Some(InputResult::Review(instructions)) = handle_slash_command(input) else {
+                panic!("expected review command for {input:?}");
+            };
+            assert_eq!(instructions.as_deref(), expected);
+        }
+        for input in ["/reviews", "/reviewer", "/review-extra"] {
+            assert!(handle_slash_command(input).is_none());
+        }
+        assert!(help_text().contains("/review [instructions]"));
+    }
 
     #[test]
     fn test_handle_slash_command() {
