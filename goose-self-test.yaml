@@ -13,6 +13,8 @@ activities:
   - Validate declared vision through persisted custom-provider configuration and outbound requests
   - Analyze code structure and parsing capabilities
   - Validate Boa JavaScript discovery, batching, cancellation, and isolation
+  - Validate interactive CLI review command parsing, session isolation, and configured reviewer selection
+  - Validate interactive CLI normal review and cross-model pool review commands
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation
@@ -181,6 +183,15 @@ prompt: |
   3. Test directory-wide analysis
   4. Test symbol focus and call graphs
   5. Verify LOC, function, and class counting
+
+  ### Interactive CLI Review Validation
+  When running from a goose source checkout:
+  1. Run `cargo test -p goose-cli --lib review` to verify slash parsing, help, completion, normal-review discovery, reviewer-pool composition, and session recovery.
+  2. In a disposable git repository with a diff and repo rules/checks, run `/review` and `/pool-review` interactively. Verify `/review` runs the normal main pass plus check subagents; `/pool-review` chooses exactly one configured model and includes applicable repository rules/check bodies in its single prompt, without dispatching them separately.
+  3. Verify `/review <text>` replaces built-in base guidance while keeping normal review passes/checks; `/pool-review <text>` adds focus to built-in guidance and retains repository rules, fixed output schema, and diff boundary. Verify omitted text uses the built-in default prompt.
+  4. Confirm the reviewer pool config contains only `name` and optional `provider`/`model`; empty/missing pool errors only for `/pool-review`, while `goose review` and `/review` retain the normal workflow. Confirm malformed pool entries fail before dispatch.
+
+  If the source checkout, Rust toolchain, interactive terminal, or configured provider is unavailable, mark the corresponding validation as skipped rather than failed.
 
   ### Azure AI Foundry Provider Validation
   When running from a goose source checkout:

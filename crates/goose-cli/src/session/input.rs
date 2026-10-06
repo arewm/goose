@@ -27,6 +27,8 @@ pub enum InputResult {
     Clear,
     New,
     Compact,
+    Review(Option<String>),
+    PoolReview(Option<String>),
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -236,6 +238,8 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT: &str = "/edit";
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
+    const CMD_REVIEW: &str = "/review";
+    const CMD_POOL_REVIEW: &str = "/pool-review";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -324,6 +328,24 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         s if s == CMD_CLEAR => Some(InputResult::Clear),
         s if s == CMD_NEW => Some(InputResult::New),
         s if s == CMD_COMPACT => Some(InputResult::Compact),
+        s if s == CMD_REVIEW
+            || s.strip_prefix(CMD_REVIEW)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace)) =>
+        {
+            let instructions = s.strip_prefix(CMD_REVIEW).unwrap_or_default().trim();
+            Some(InputResult::Review(
+                (!instructions.is_empty()).then(|| instructions.to_string()),
+            ))
+        }
+        s if s == CMD_POOL_REVIEW
+            || s.strip_prefix(CMD_POOL_REVIEW)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace)) =>
+        {
+            let instructions = s.strip_prefix(CMD_POOL_REVIEW).unwrap_or_default().trim();
+            Some(InputResult::PoolReview(
+                (!instructions.is_empty()).then(|| instructions.to_string()),
+            ))
+        }
         // Match "/skills" exactly or "/skills " with args - avoids matching e.g. "/skillsextra"
         s if s == CMD_SKILLS || s.starts_with(&format!("{CMD_SKILLS} ")) => {
             let args = s.get(CMD_SKILLS.len()..).unwrap_or("").trim();
@@ -432,6 +454,8 @@ fn help_text() -> String {
 /model [name] - Show the current model, or switch models for this session while keeping the same provider
 /model --provider <name> [model] - Switch to a different provider (optionally specifying a model)
 /compact - Compact the current conversation to reduce context length while preserving key information.
+/review [text] - Run the normal review workflow; text replaces default review guidance.
+/pool-review [text] - Run one randomly selected pool reviewer; text adds focus to default guidance.
 {additional_builtin_help}/status - Show session status: model, provider, mode, and token usage.
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
@@ -493,6 +517,51 @@ fn print_editor_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_review_command() {
+        for (input, expected) in [
+            ("/review", None),
+            ("  /review  ", None),
+            ("/review focus on security", Some("focus on security")),
+            ("/review   keep  spacing  ", Some("keep  spacing")),
+            ("/review\tfocus on tests", Some("focus on tests")),
+            ("/review --range main", Some("--range main")),
+            (
+                "/review \"quoted\"\nsecond line",
+                Some("\"quoted\"\nsecond line"),
+            ),
+        ] {
+            let Some(InputResult::Review(instructions)) = handle_slash_command(input) else {
+                panic!("expected review command for {input:?}");
+            };
+            assert_eq!(instructions.as_deref(), expected);
+        }
+        for input in ["/reviews", "/reviewer", "/review-extra"] {
+            assert!(handle_slash_command(input).is_none());
+        }
+        assert!(help_text().contains("/review [text]"));
+    }
+
+    #[test]
+    fn test_pool_review_command_boundaries_and_arguments() {
+        for (input, expected) in [
+            ("/pool-review", None),
+            ("  /pool-review  ", None),
+            ("/pool-review focus on security", Some("focus on security")),
+            ("/pool-review   keep  spacing  ", Some("keep  spacing")),
+            ("/pool-review\tfocus on tests", Some("focus on tests")),
+        ] {
+            let Some(InputResult::PoolReview(instructions)) = handle_slash_command(input) else {
+                panic!("expected pool review command for {input:?}");
+            };
+            assert_eq!(instructions.as_deref(), expected);
+        }
+        for input in ["/pool-reviews", "/pool-reviewer", "/pool-review-extra"] {
+            assert!(handle_slash_command(input).is_none());
+        }
+        assert!(help_text().contains("/pool-review [text]"));
+    }
 
     #[test]
     fn test_handle_slash_command() {

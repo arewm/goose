@@ -492,6 +492,31 @@ Review the current git diff using goose. By default, `goose review` reviews the 
 
 `goose review` can discover review checks from `.agents/checks/*.md` and scoped review instructions from `.agents/REVIEW.md`.
 
+To use a configured reviewer pool instead, add explicit entries to `~/.config/goose/config.yaml`:
+
+```yaml
+GOOSE_REVIEWER_POOL:
+  - name: anthropic-review
+    provider: anthropic
+    model: claude-opus-4-8
+  - name: openai-review
+    provider: openai
+    model: gpt-6.1-sol
+  - name: vertex-flash-review
+    provider: gcp_vertex_ai
+    model: gemini-3.8-flash
+```
+
+`/review [text]` runs the normal review workflow: the main review plus discovered checks from
+`.agents/checks/*.md` and applicable `.agents/REVIEW.md` files. `/pool-review [text]` instead picks
+one model/provider uniformly at random and sends it the full diff in one review request. In pool
+mode, applicable check and `REVIEW.md` contents are included as guidance in that request; they are
+not dispatched as separate agents. The configured pool entries contain a unique `name` and
+optional `provider` and `model` only. An absent or empty pool makes `/pool-review` report a clear
+configuration error; malformed entries also fail before review dispatch.
+
+With `/review`, optional `text` replaces the built-in base prompt; the normal review process and discovered checks still apply. With `/pool-review`, optional `text` adds focus to the built-in review guidance. Repository rules, scope, and the structured findings contract always remain.
+
 **Options:**
 - **`--prompt <FILE>`**: Use a custom base review prompt
 - **`--model <MODEL>`**: Set the default model for the main review agent and checks that do not declare their own model
@@ -826,6 +851,8 @@ Once you're in an interactive session (via `goose session` or `goose run --inter
 - **`/prompt <n> [--info] [key=value...]`** - Get prompt info or execute a prompt
 - **`/prompts [--extension <name>]`** - List all available prompts, optionally filtered by extension
 - **`/compact`** - Compact and summarize the current conversation to reduce context length while preserving key information
+- **`/review [text]`** - Run the normal review workflow on current local changes, including discovered checks and `REVIEW.md` rules; optional text replaces the default review guidance
+- **`/pool-review [text]`** - Run one randomly selected reviewer from `GOOSE_REVIEWER_POOL`; optional text adds focus while repository review rules are included
 - **`/r`** - Toggle full tool output display (show complete tool parameters without truncation)
 - **`/skills [<name>...]`** - List available skills, or load one or more skills by name
 - **`/t`** - Toggle between `light`, `dark`, and `ansi` themes. [More info](#themes).
