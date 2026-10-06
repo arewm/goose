@@ -619,12 +619,28 @@ async fn collect_extension_configs(
     Ok(all.into_iter().map(|(_, config)| config).collect())
 }
 
+fn terminal_width_instruction(width: usize) -> String {
+    let content_width = width.saturating_sub(4).max(1);
+    format!(
+        "Keep Markdown tables, ASCII diagrams, and other fixed-width text no wider than roughly {content_width} terminal columns. For tables, use concise headers and cell text; split wide tables into smaller tables or use bullets when clearer. Do not use spacing to align plain-text columns."
+    )
+}
+
 async fn configure_session_prompts(
     session_manager: &SessionManager,
     session_id: &str,
     config: &Config,
     session_config: &SessionBuilderConfig,
 ) -> anyhow::Result<()> {
+    if let Some((_, width)) = console::Term::stdout().size_checked() {
+        session_manager
+            .set_system_prompt_extra(
+                session_id,
+                "terminal_width",
+                Some(terminal_width_instruction(width as usize)),
+            )
+            .await?;
+    }
     if let Some(ref additional_prompt) = session_config.additional_system_prompt {
         session_manager
             .set_system_prompt_extra(session_id, "additional", Some(additional_prompt.clone()))
@@ -915,6 +931,11 @@ mod tests {
     use goose::config::{set_provider_entry, ProviderEntry};
     use goose::session::SessionManager;
     use tempfile::TempDir;
+
+    #[test]
+    fn terminal_width_instruction_uses_available_columns() {
+        assert!(terminal_width_instruction(100).contains("roughly 96 terminal columns"));
+    }
 
     fn stdio_names(extensions: &[&str]) -> Vec<String> {
         let parsed = parse_cli_flag_extensions(
