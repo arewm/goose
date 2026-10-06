@@ -1,17 +1,19 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::session::{build_session, SessionBuilderConfig};
+use crate::session::{SessionBuilderConfig, build_session};
 
-use goose::checks::{discover, DiscoveredReview};
+use goose::checks::{DiscoveredReview, discover};
+use goose::config::Config;
 use goose::subprocess::git_command;
 
 use super::orchestrator::{
-    emit_findings, run_checks_in_parallel, run_main_pass_in_parallel, Severity,
+    Severity, emit_findings, run_checks_in_parallel, run_main_pass_in_parallel,
 };
-use super::prompt::{build_review_prompt, DEFAULT_REVIEW_PROMPT};
+use super::prompt::{DEFAULT_REVIEW_PROMPT, build_review_prompt};
+use super::reviewer_pool::{REVIEWER_POOL_KEY, load_pool, random_reviewer, resolve_provider_model};
 
 /// Options shared by `goose review` and the interactive `/review` command.
 #[derive(Debug, Clone, Default)]
@@ -75,6 +77,8 @@ pub struct ReviewOptions {
 /// Shared by `goose review` and interactive `/review`; results are printed directly
 /// to the terminal and errors are returned to the caller.
 pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
+    let config = Config::global();
+    let pool = load_pool(config)?;
     let repo_root = find_repo_root().context("not inside a git repository")?;
     let untracked_root = opts
         .range
@@ -125,6 +129,58 @@ pub async fn handle_review(opts: ReviewOptions) -> Result<()> {
     if opts.summary_only {
         let summary = collect_diff_stat(&repo_root, opts.range.as_deref(), &opts.files)?;
         print!("{}", summary);
+        return Ok(());
+    }
+
+    if !pool.is_empty()
+        && (opts.checks_only
+            || !opts.check_filter.is_empty()
+            || opts.check_scope.is_some()
+            || opts.no_orchestrate)
+    {
+        anyhow::bail!(
+            "reviewer-pool mode always runs exactly one reviewer; --checks-only, --check-filter, --check-scope, and --no-orchestrate are not supported with {REVIEWER_POOL_KEY}"
+        );
+    }
+
+    if let Some(reviewer) = random_reviewer(&pool) {
+        let (provider, model) = resolve_provider_model(reviewer, &opts, config).await?;
+        eprintln!(
+            "goose review: selected reviewer '{}' (provider: {}, model: {})",
+            reviewer.name, provider, model
+        );
+        let base_prompt = match &opts.prompt_file {
+            Some(path) => fs::read_to_string(path)
+                .with_context(|| format!("read --prompt file {}", path.display()))?,
+            None => DEFAULT_REVIEW_PROMPT.to_string(),
+        };
+        let check = reviewer.as_check(&base_prompt);
+        let turns = check.resolved_turn_limit(opts.default_turn_limit);
+        if opts.dry_run {
+            println!(
+                "{}",
+                super::orchestrator::build_check_prompt(
+                    &check,
+                    &diff,
+                    opts.instructions.as_deref(),
+                    turns,
+                    true,
+                )
+            );
+            println!("\n# reviewer pool: exactly one tool-free dispatch for the whole diff");
+            return Ok(());
+        }
+        let findings = super::orchestrator::run_single_check_subprocess(
+            &check,
+            &diff,
+            Some(&provider),
+            Some(&model),
+            opts.instructions.as_deref(),
+            Some(turns),
+            true,
+        )
+        .await?;
+        emit_findings(&findings, min_sev);
         return Ok(());
     }
 
@@ -849,14 +905,14 @@ fn windows_open_at(
     allow_delete: bool,
 ) -> std::io::Result<fs::File> {
     use ntapi::ntioapi::{
-        NtCreateFile, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, IO_STATUS_BLOCK,
+        FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        IO_STATUS_BLOCK, NtCreateFile,
     };
     use std::io::{Error, ErrorKind};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use winapi::shared::ntdef::{
-        HANDLE, NT_SUCCESS, OBJECT_ATTRIBUTES, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+        HANDLE, NT_SUCCESS, OBJ_CASE_INSENSITIVE, OBJECT_ATTRIBUTES, UNICODE_STRING,
     };
     use winapi::um::winnt::{
         FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -936,7 +992,7 @@ fn windows_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn windows_read_symlink_target(file: &fs::File) -> std::io::Result<Option<String>> {
-    use ntapi::ntioapi::{NtFsControlFile, IO_STATUS_BLOCK};
+    use ntapi::ntioapi::{IO_STATUS_BLOCK, NtFsControlFile};
     use std::io::{Error, ErrorKind};
     use std::os::windows::io::AsRawHandle;
     use winapi::shared::ntdef::NT_SUCCESS;
@@ -1390,24 +1446,28 @@ mod tests {
         let root_path = parent.path().join("repo");
         let moved_root = parent.path().join("moved-repo");
         fs::create_dir(&root_path).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&root_path)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root_path)
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(root_path.join(".gitignore"), "secret.txt\n").unwrap();
         fs::write(root_path.join("secret.txt"), "original ignored content").unwrap();
         let root = open_test_untracked_root(&root_path).unwrap();
 
         fs::rename(&root_path, &moved_root).unwrap();
         fs::create_dir(&root_path).unwrap();
-        assert!(Command::new("git")
-            .args(["init", "--quiet"])
-            .current_dir(&root_path)
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root_path)
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::write(
             root_path.join("secret.txt"),
             "replacement untracked content",
