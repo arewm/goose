@@ -496,12 +496,27 @@ To use a configured reviewer pool instead, add explicit entries to `~/.config/go
 
 ```yaml
 GOOSE_REVIEWER_POOL:
-  - name: correctness
-    instructions: Review for correctness, edge cases, and regressions.
-  - name: security
-    instructions: Review for exploitable security issues in the changed code.
+  - name: anthropic-review
+    instructions: >-
+      Review the full diff for correctness, security, and regressions. Report only
+      concrete, high-confidence findings with file paths, changed-line numbers,
+      severity, and a concise explanation. Do not modify files.
     provider: anthropic
     model: claude-sonnet-4-6
+  - name: openai-review
+    instructions: >-
+      Review the full diff for correctness, security, and regressions. Report only
+      concrete, high-confidence findings with file paths, changed-line numbers,
+      severity, and a concise explanation. Do not modify files.
+    provider: openai
+    model: gpt-5.5
+  - name: vertex-flash-review
+    instructions: >-
+      Review the full diff for correctness, security, and regressions. Report only
+      concrete, high-confidence findings with file paths, changed-line numbers,
+      severity, and a concise explanation. Do not modify files.
+    provider: gcp_vertex_ai
+    model: gemini-3.8-flash
 ```
 
 A nonempty pool activates single-reviewer mode for both `goose review` and interactive `/review`.
