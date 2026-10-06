@@ -1,6 +1,6 @@
 use super::completion::GooseCompleter;
 use super::paste::{
-    read_paste_aware_input, PasteAwareEnterHandler, PasteCaptureHandler, PasteState,
+    PasteAwareEnterHandler, PasteCaptureHandler, PasteState, read_paste_aware_input,
 };
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
@@ -330,7 +330,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
             || s.strip_prefix(CMD_REVIEW)
                 .is_some_and(|rest| rest.starts_with(char::is_whitespace)) =>
         {
-            let instructions = s[CMD_REVIEW.len()..].trim();
+            let instructions = s.strip_prefix(CMD_REVIEW).unwrap_or_default().trim();
             Some(InputResult::Review(
                 (!instructions.is_empty()).then(|| instructions.to_string()),
             ))

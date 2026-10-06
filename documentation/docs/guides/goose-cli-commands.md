@@ -492,6 +492,34 @@ Review the current git diff using goose. By default, `goose review` reviews the 
 
 `goose review` can discover review checks from `.agents/checks/*.md` and scoped review instructions from `.agents/REVIEW.md`.
 
+To use a configured reviewer pool instead, add explicit entries to `~/.config/goose/config.yaml`:
+
+```yaml
+GOOSE_REVIEWER_POOL:
+  - name: correctness
+    instructions: Review for correctness, edge cases, and regressions.
+  - name: security
+    instructions: Review for exploitable security issues in the changed code.
+    provider: anthropic
+    model: claude-sonnet-4-6
+```
+
+A nonempty pool activates single-reviewer mode for both `goose review` and interactive `/review`.
+goose selects exactly one entry uniformly at random and reports its name, provider, and model.
+That reviewer receives the whole diff in one dispatch in chat-only mode, so goose exposes no MCP tools or subagent delegation to it. Reviewer-pool mode rejects providers that run external coding agents with their own native tools.
+The standard main pass, discovered checks, and delegated synthesis do not run in this mode.
+`--checks-only`, `--check-filter`, `--check-scope`, and `--no-orchestrate` are rejected when a
+nonempty pool is configured. `--summary-only` still skips the review, and `--dry-run` prints the
+selected review prompt.
+
+Reviewer provider/model settings take precedence over command or interactive-session defaults;
+`--override-model` still forces a model. When a reviewer changes the provider without specifying
+a model, goose uses that provider's configured/default model rather than the session's model.
+`--prompt` and additional review instructions still apply. Each entry requires a unique, nonempty
+`name` and nonempty `instructions`; only optional `provider` and `model` fields are accepted.
+Missing pools and empty lists retain the existing multi-check workflow; malformed pools are errors.
+
+
 **Options:**
 - **`--prompt <FILE>`**: Use a custom base review prompt
 - **`--model <MODEL>`**: Set the default model for the main review agent and checks that do not declare their own model

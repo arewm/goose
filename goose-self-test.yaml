@@ -11,7 +11,7 @@ activities:
   - Validate Azure AI Foundry provider routing and deployment aliases
   - Validate the configurable Databricks AI Gateway path across all inference routes
   - Analyze code structure and parsing capabilities
-  - Validate interactive CLI review command parsing and session isolation
+  - Validate interactive CLI review command parsing, session isolation, and configured reviewer selection
   - Test extension discovery and management
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation
@@ -170,6 +170,9 @@ prompt: |
   1. Run `cargo test -p goose-cli --lib review` to verify `/review [instructions]` parsing, help, completion, session provider/model forwarding, and error recovery alongside standalone review tests.
   2. In an interactive CLI session in a disposable git repository with local changes, run `/review focus on correctness`. Verify findings appear in the terminal and the input prompt returns without changing the conversation.
   3. Verify `/review` without instructions works and `/reviewer` is not treated as the review command.
+  4. In an isolated configuration, set `GOOSE_REVIEWER_POOL` to explicit entries with `name`, `instructions`, and optional `provider`/`model`. Run `goose review --dry-run` and `/review`; verify each reports exactly one selected reviewer and effective provider/model, receives the whole diff, and skips discovered checks, per-file main passes, and synthesis.
+  5. Verify configured reviewer provider/model override session defaults, a provider change does not inherit an incompatible session model, and `--override-model` wins. Remove the pool or use `[]` and verify legacy review behavior returns; malformed entries must fail without dispatch.
+
   If the source checkout, Rust toolchain, interactive terminal, or configured provider is unavailable, mark the corresponding validation as skipped rather than failed.
 
   ### Azure AI Foundry Provider Validation
