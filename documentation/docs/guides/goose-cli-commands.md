@@ -502,14 +502,14 @@ GOOSE_REVIEWER_POOL:
       concrete, high-confidence findings with file paths, changed-line numbers,
       severity, and a concise explanation. Do not modify files.
     provider: anthropic
-    model: claude-sonnet-4-6
+    model: claude-opus-4-8
   - name: openai-review
     instructions: >-
       Review the full diff for correctness, security, and regressions. Report only
       concrete, high-confidence findings with file paths, changed-line numbers,
       severity, and a concise explanation. Do not modify files.
     provider: openai
-    model: gpt-5.5
+    model: gpt-6.1-sol
   - name: vertex-flash-review
     instructions: >-
       Review the full diff for correctness, security, and regressions. Report only
