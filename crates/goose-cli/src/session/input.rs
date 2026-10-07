@@ -1,6 +1,6 @@
 use super::completion::GooseCompleter;
 use super::paste::{
-    PasteAwareEnterHandler, PasteCaptureHandler, PasteState, read_paste_aware_input,
+    read_paste_aware_input, PasteAwareEnterHandler, PasteCaptureHandler, PasteState,
 };
 use super::{CompletionCache, HintStatus};
 use anyhow::Result;
@@ -28,6 +28,7 @@ pub enum InputResult {
     New,
     Compact,
     Review(Option<String>),
+    PoolReview(Option<String>),
     ToggleFullToolOutput,
     Edit(Option<String>),
     ListSkills,
@@ -238,6 +239,7 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
     const CMD_EDIT_WITH_SPACE: &str = "/edit ";
     const CMD_SKILLS: &str = "/skills";
     const CMD_REVIEW: &str = "/review";
+    const CMD_POOL_REVIEW: &str = "/pool-review";
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
@@ -332,6 +334,15 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
         {
             let instructions = s.strip_prefix(CMD_REVIEW).unwrap_or_default().trim();
             Some(InputResult::Review(
+                (!instructions.is_empty()).then(|| instructions.to_string()),
+            ))
+        }
+        s if s == CMD_POOL_REVIEW
+            || s.strip_prefix(CMD_POOL_REVIEW)
+                .is_some_and(|rest| rest.starts_with(char::is_whitespace)) =>
+        {
+            let instructions = s.strip_prefix(CMD_POOL_REVIEW).unwrap_or_default().trim();
+            Some(InputResult::PoolReview(
                 (!instructions.is_empty()).then(|| instructions.to_string()),
             ))
         }
@@ -443,7 +454,8 @@ fn help_text() -> String {
 /model [name] - Show the current model, or switch models for this session while keeping the same provider
 /model --provider <name> [model] - Switch to a different provider (optionally specifying a model)
 /compact - Compact the current conversation to reduce context length while preserving key information.
-/review [instructions] - Review local changes using the current provider and model, then return to the session.
+/review [text] - Run the normal review workflow; text replaces default review guidance.
+/pool-review [text] - Run one randomly selected pool reviewer; text adds focus to default guidance.
 {additional_builtin_help}/status - Show session status: model, provider, mode, and token usage.
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
@@ -528,7 +540,27 @@ mod tests {
         for input in ["/reviews", "/reviewer", "/review-extra"] {
             assert!(handle_slash_command(input).is_none());
         }
-        assert!(help_text().contains("/review [instructions]"));
+        assert!(help_text().contains("/review [text]"));
+    }
+
+    #[test]
+    fn test_pool_review_command_boundaries_and_arguments() {
+        for (input, expected) in [
+            ("/pool-review", None),
+            ("  /pool-review  ", None),
+            ("/pool-review focus on security", Some("focus on security")),
+            ("/pool-review   keep  spacing  ", Some("keep  spacing")),
+            ("/pool-review\tfocus on tests", Some("focus on tests")),
+        ] {
+            let Some(InputResult::PoolReview(instructions)) = handle_slash_command(input) else {
+                panic!("expected pool review command for {input:?}");
+            };
+            assert_eq!(instructions.as_deref(), expected);
+        }
+        for input in ["/pool-reviews", "/pool-reviewer", "/pool-review-extra"] {
+            assert!(handle_slash_command(input).is_none());
+        }
+        assert!(help_text().contains("/pool-review [text]"));
     }
 
     #[test]
