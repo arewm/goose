@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, bail};
-use goose::checks::Check;
+use anyhow::{bail, Context, Result};
+use goose::checks::{Check, DiscoveredReview};
 use goose::config::{Config, ConfigError};
 use rand::RngExt;
 use serde::Deserialize;
@@ -26,13 +26,17 @@ const PROVIDERS_WITH_NATIVE_TOOLS: &[&str] = &[
 #[serde(deny_unknown_fields)]
 pub struct Reviewer {
     pub name: String,
-    pub instructions: String,
     pub provider: Option<String>,
     pub model: Option<String>,
 }
 
 impl Reviewer {
-    pub fn as_check(&self, base_prompt: &str) -> Check {
+    pub fn as_check(
+        &self,
+        review_prompt: &str,
+        discovered: &DiscoveredReview,
+        user_text: Option<&str>,
+    ) -> Check {
         Check {
             name: self.name.clone(),
             description: None,
@@ -42,23 +46,73 @@ impl Reviewer {
             severity_default: None,
             path: Default::default(),
             scope_dir: String::new(),
-            body: format!(
-                "{}\n\n## Selected reviewer persona\n\n{}",
-                pool_review_prompt(base_prompt),
-                self.instructions
-            ),
+            body: pool_review_prompt(review_prompt, discovered, user_text),
         }
     }
 }
 
-fn pool_review_prompt(base_prompt: &str) -> String {
-    let body = match base_prompt.split_once("## Output") {
-        Some((review_role, _)) => review_role.trim_end(),
-        None => base_prompt.trim_end(),
+fn pool_review_prompt(
+    base_prompt: &str,
+    discovered: &DiscoveredReview,
+    user_text: Option<&str>,
+) -> String {
+    let base_prompt = if base_prompt == super::prompt::DEFAULT_REVIEW_PROMPT {
+        strip_default_prompt_sections(base_prompt)
+    } else {
+        base_prompt.trim_end().to_string()
     };
-    format!(
-        "{body}\n\nReview the entire diff as one reviewer. Do not delegate, synthesize other reviews, or use tools. Return ONLY valid JSON with the exact schema {{\"findings\":[{{\"severity\":\"low|medium|high|critical\",\"path\":\"relative/path\",\"line_start\":1,\"line_end\":1,\"summary\":\"Actionable issue and fix\"}}]}}. If no findings, return {{\"findings\":[]}}. Do not return the legacy per-finding JSON-lines format."
-    )
+    let mut prompt = String::new();
+    if !base_prompt.trim().is_empty() {
+        prompt.push_str(base_prompt.trim_end());
+        prompt.push_str("\n\n");
+    }
+    if let Some(text) = user_text.map(str::trim).filter(|text| !text.is_empty()) {
+        prompt.push_str("## Additional user review context\n\n");
+        prompt.push_str(text);
+        prompt.push_str("\n\n");
+    }
+    if !discovered.checks.is_empty() {
+        prompt.push_str("## Applicable repository review instructions\n\n");
+        for check in &discovered.checks {
+            let scope = if check.scope_dir.is_empty() {
+                "<root>"
+            } else {
+                &check.scope_dir
+            };
+            prompt.push_str(&format!(
+                "### {} (scope: {})\n\n{}\n\n",
+                check.name,
+                scope,
+                check.body.trim()
+            ));
+        }
+    }
+    prompt.push_str("Review the entire diff as one reviewer. Do not delegate, synthesize other reviews, or use tools. Return ONLY valid JSON with the exact schema {\"findings\":[{\"severity\":\"low|medium|high|critical\",\"path\":\"relative/path\",\"line_start\":1,\"line_end\":1,\"summary\":\"Actionable issue and fix\"}]}. If no findings, return {\"findings\":[]}. Do not include any text outside the JSON object.");
+    prompt
+}
+
+fn strip_default_prompt_sections(prompt: &str) -> String {
+    let mut result = String::new();
+    let mut skip = false;
+    for line in prompt.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            skip = matches!(heading, "Output" | "Checks");
+        }
+        if !skip {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    let result = result
+        .replace(
+            "Before delegating to subagent checks, do a careful correctness pass on the\ndiff yourself. Walk every changed function and look hard for:",
+            "Walk every changed function and look hard for:",
+        )
+        .replace(
+            "Emit findings from this pass with `\"check\": \"main\"`.",
+            "",
+        );
+    result.trim_end().to_string()
 }
 
 pub fn load_pool(config: &Config) -> Result<Vec<Reviewer>> {
@@ -77,8 +131,8 @@ pub fn load_pool(config: &Config) -> Result<Vec<Reviewer>> {
 fn validate_pool(pool: &[Reviewer]) -> Result<()> {
     let mut names = HashSet::new();
     for reviewer in pool {
-        if reviewer.name.trim().is_empty() || reviewer.instructions.trim().is_empty() {
-            bail!("{REVIEWER_POOL_KEY}: each reviewer needs a nonempty name and instructions");
+        if reviewer.name.trim().is_empty() {
+            bail!("{REVIEWER_POOL_KEY}: each reviewer needs a nonempty name");
         }
         if !names.insert(reviewer.name.trim()) {
             bail!(
@@ -180,7 +234,6 @@ mod tests {
     fn reviewer(name: &str) -> Reviewer {
         Reviewer {
             name: name.into(),
-            instructions: "Review for correctness".into(),
             provider: None,
             model: None,
         }
@@ -204,31 +257,53 @@ mod tests {
     }
 
     #[test]
-    fn reviewer_prompt_contains_whole_diff_and_only_selected_persona() {
+    fn reviewer_prompt_contains_diff_override_and_repository_rules() {
+        use goose::checks::Check;
+        use std::path::PathBuf;
+
         let pool = vec![reviewer("first"), reviewer("second")];
         let selected = select_reviewer(&pool, |_| 1).unwrap();
-        let check = selected.as_check("Base review instructions");
+        let discovered = DiscoveredReview {
+            checks: vec![Check {
+                name: "repo-rules".into(),
+                description: None,
+                model: None,
+                turn_limit: None,
+                tools: None,
+                severity_default: None,
+                path: PathBuf::from(".agents/REVIEW.md"),
+                scope_dir: "".into(),
+                body: "Follow repository rules".into(),
+            }],
+        };
+        let default_prompt = include_str!("default_review_prompt.md");
+        let adapted_default_prompt = pool_review_prompt(default_prompt, &discovered, None);
+        assert!(adapted_default_prompt.contains("correctness bugs"));
+        assert!(!adapted_default_prompt.contains("single line containing `[]`"));
+        assert!(!adapted_default_prompt.contains("Dispatch them all in parallel"));
+        assert!(adapted_default_prompt.contains("Follow repository rules"));
+        assert!(adapted_default_prompt.contains("Return ONLY valid JSON"));
+        assert!(adapted_default_prompt.contains("\"findings\":[]"));
+        let check = selected.as_check(
+            "User-supplied review prompt",
+            &discovered,
+            Some("Focus on authorization regressions"),
+        );
         assert_eq!(check.name, "second");
         assert_eq!(check.tools, Some(Vec::new()));
-        let standalone_prompt = include_str!("default_review_prompt.md");
-        let pool_prompt = pool_review_prompt(standalone_prompt);
-        assert!(pool_prompt.contains("Return ONLY valid JSON with the exact schema"));
-        assert!(!pool_prompt.contains("Return a single line containing `[]`"));
-        assert!(!pool_prompt.contains("## Checks"));
+        assert!(check.body.contains("User-supplied review prompt"));
+        assert!(check.body.contains("Focus on authorization regressions"));
+        assert!(check.body.contains("Follow repository rules"));
+        assert!(check
+            .body
+            .contains("Do not include any text outside the JSON object"));
         let diff = "diff --git a/one b/one\n+one\ndiff --git a/two b/two\n+two";
-        let prompt = super::super::orchestrator::build_check_prompt(
-            &check,
-            diff,
-            Some("Interactive review context"),
-            7,
-            true,
-        );
+        let prompt = super::super::orchestrator::build_check_prompt(&check, diff, None, 7, true);
         assert!(prompt.contains(diff));
-        assert!(prompt.contains("Base review instructions"));
-        assert!(prompt.contains(&selected.instructions));
-        assert!(prompt.contains("Interactive review context"));
+        assert!(prompt.contains("User-supplied review prompt"));
+        assert!(prompt.contains("Focus on authorization regressions"));
+        assert!(prompt.contains("Follow repository rules"));
         assert!(prompt.contains("Do not delegate"));
-        assert!(!prompt.contains("Check name: first"));
     }
 
     #[test]
@@ -236,11 +311,10 @@ mod tests {
         assert!(validate_pool(&[]).is_ok());
         assert!(validate_pool(&[reviewer("valid")]).is_ok());
         assert!(validate_pool(&[reviewer("same"), reviewer("same")]).is_err());
-        for field in ["name", "instructions", "provider", "model"] {
+        for field in ["name", "provider", "model"] {
             let mut entry = reviewer("valid");
             match field {
                 "name" => entry.name = " ".into(),
-                "instructions" => entry.instructions.clear(),
                 "provider" => entry.provider = Some(" ".into()),
                 "model" => entry.model = Some(String::new()),
                 _ => unreachable!(),
@@ -372,13 +446,11 @@ mod tests {
         );
 
         entry.provider = Some("codex".into());
-        assert!(
-            resolve_provider_model(&entry, &opts, &config)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("native tools")
-        );
+        assert!(resolve_provider_model(&entry, &opts, &config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("native tools"));
     }
 
     #[test]
@@ -391,7 +463,7 @@ mod tests {
         )
         .unwrap();
         assert!(load_pool(&config).unwrap().is_empty());
-        for yaml in ["[]", "- name: safe\n  instructions: Review correctness\n"] {
+        for yaml in ["[]", "- name: safe\n"] {
             config
                 .set_param(
                     REVIEWER_POOL_KEY,
@@ -404,9 +476,7 @@ mod tests {
             "null",
             "{}",
             "not-a-list",
-            "- name: missing-instructions",
-            "- name: unsafe\n  instructions: Review\n  tools: [summon]",
-            "- name: blank\n  instructions: ' '",
+            "- name: unsafe\n  tools: [summon]",
         ] {
             config
                 .set_param(
