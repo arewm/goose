@@ -2949,6 +2949,9 @@ pub async fn cli() -> anyhow::Result<()> {
             handle_review(ReviewOptions {
                 range,
                 prompt_file: prompt,
+                prompt_override: None,
+                pool_focus: None,
+                pool_only: false,
                 default_model: model,
                 provider,
                 override_model,
