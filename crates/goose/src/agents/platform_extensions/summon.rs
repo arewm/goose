@@ -381,7 +381,21 @@ fn build_subagent_instructions(sources: &[SourceEntry]) -> String {
          instructions: ...)`, which runs it as an isolated subagent and \
          returns its result. Use `load(source: \"<name>\")` instead if you \
          only want to read the subagent's instructions into your own \
+<<<<<<< HEAD
          context.",
+||||||| parent of 0871051 (agent: Preserve inspection context in tool denials)
+         context. For long-running work, pass `async: true` to `delegate` — \
+         it returns a task id immediately, and you collect the result later \
+         with `load(source: "<task_id>")`, which waits for completion.\n\n\
+         When overriding subagent models, use the appropriate configured provider \
+         (e.g. `gcp_vertex_ai` for Google Gemini models, `openai` for OpenAI models).",
+=======
+         context. For long-running work, pass `async: true` to `delegate` — \
+         it returns a task id immediately, and you collect the result later \
+         using `load` with the returned task ID to wait for completion.\n\n\
+         When overriding subagent models, use the appropriate configured provider \
+         (e.g. `gcp_vertex_ai` for Google Gemini models, `openai` for OpenAI models).",
+>>>>>>> 0871051 (agent: Preserve inspection context in tool denials)
     ));
 
     out

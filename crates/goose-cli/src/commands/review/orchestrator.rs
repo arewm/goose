@@ -911,13 +911,13 @@ mod tests {
             ("GOOSE_DISABLE_KEYRING", Some("true")),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        let manager = goose::agents::extension_manager::ExtensionManager::new_without_provider(
+        let manager = goose::agents::extension_manager::ExtensionManager::with_data_dir(
             dir.path().to_path_buf(),
         );
-        let tools = manager
-            .get_prefixed_tools("reviewer-without-extensions", None)
-            .await
-            .unwrap();
+        let lease = manager
+            .current_lease("reviewer-without-extensions", None)
+            .await;
+        let tools = lease.tools().await;
         assert!(
             tools.is_empty(),
             "review subprocesses without profile/extensions must not expose delegation tools"
