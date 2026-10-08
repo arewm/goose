@@ -7,17 +7,17 @@ use async_trait::async_trait;
 
 use crate::agents::state_machine::ops_toolcalling::request_was_advertised;
 use crate::agents::state_machine::{
-    applied, messages_since_kickoff, not_applicable, ConversationEffect, Emitter, GooseEffect,
-    Operation, OperationResult,
+    ConversationEffect, Emitter, GooseEffect, Operation, OperationResult, applied,
+    messages_since_kickoff, not_applicable,
 };
-use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
-use crate::conversation::message::{ActionRequiredData, Message, MessageContent, ToolRequest};
+use crate::config::permission::PermissionLevel;
 use crate::conversation::Conversation;
+use crate::conversation::message::{ActionRequiredData, Message, MessageContent, ToolRequest};
 use crate::permission::Permission;
 use crate::session::Session;
 use crate::tool_inspection::{
-    get_security_finding_id_from_results, InspectionAction, ToolInspectionManager,
+    InspectionAction, ToolInspectionManager, get_security_finding_id_from_results,
 };
 use tokio::sync::Mutex;
 
@@ -107,7 +107,11 @@ impl Operation<Session, GooseEffect> for ToolApprovalOperation<'_> {
                 );
 
             for request in permission_check_result.denied {
-                effects.push(mark_executable(&request.id, false));
+                let denial_reason = crate::tool_inspection::denial_reason_for_request(
+                    &request.id,
+                    &inspection_results,
+                );
+                effects.push(mark_denied(&request.id, denial_reason.as_deref()));
             }
 
             for request in permission_check_result.needs_approval {
@@ -290,6 +294,19 @@ fn mark_executable(tool_call_id: &str, executable: bool) -> GooseEffect {
     ConversationEffect::PatchToolRequestMeta {
         tool_call_id: tool_call_id.to_string(),
         patch: serde_json::json!({ TOOL_EXECUTABLE_KEY: executable }),
+    }
+    .into()
+}
+
+fn mark_denied(tool_call_id: &str, reason: Option<&str>) -> GooseEffect {
+    let mut patch = serde_json::json!({ TOOL_EXECUTABLE_KEY: false });
+    if let Some(reason) = reason {
+        patch[crate::agents::tool_execution::TOOL_DENIAL_REASON_KEY] =
+            serde_json::Value::String(reason.to_string());
+    }
+    ConversationEffect::PatchToolRequestMeta {
+        tool_call_id: tool_call_id.to_string(),
+        patch,
     }
     .into()
 }

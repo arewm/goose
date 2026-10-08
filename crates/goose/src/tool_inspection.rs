@@ -18,6 +18,27 @@ pub struct InspectionResult {
     pub finding_id: Option<String>,
 }
 
+pub fn denial_reason_for_request(
+    tool_request_id: &str,
+    inspection_results: &[InspectionResult],
+) -> Option<String> {
+    let reasons = inspection_results
+        .iter()
+        .filter(|result| {
+            result.tool_request_id == tool_request_id && result.action == InspectionAction::Deny
+        })
+        .map(|result| {
+            let inspector = if result.inspector_name == "permission" {
+                "permission policy"
+            } else {
+                &result.inspector_name
+            };
+            format!("{inspector}: {}", result.reason.trim())
+        })
+        .collect::<Vec<_>>();
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
 /// Action to take based on inspection result
 #[derive(Debug, Clone, PartialEq)]
 pub enum InspectionAction {

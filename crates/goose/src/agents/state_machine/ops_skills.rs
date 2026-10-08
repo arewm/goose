@@ -3,28 +3,28 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{CallToolResult, ContentBlock, ErrorData, JsonObject, Tool};
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing_futures::Instrument;
 
 use crate::agents::extension_manager::ExtensionLease;
 use crate::agents::state_machine::ops_toolcalling::{
-    emit_post_tool_use, pending_advertised_tool_requests, run_pre_tool_hooks, tool_span,
-    ToolDisposition, EXPIRED_APPROVAL_RESPONSE,
+    EXPIRED_APPROVAL_RESPONSE, ToolDisposition, emit_post_tool_use,
+    pending_advertised_tool_requests, run_pre_tool_hooks, tool_span,
 };
 use crate::agents::state_machine::{
-    applied, messages_since_kickoff, not_applicable, yielded_with, ConversationEffect, Emitter,
-    GooseEffect, Operation, OperationResult, SlashCommand,
+    ConversationEffect, Emitter, GooseEffect, Operation, OperationResult, SlashCommand, applied,
+    messages_since_kickoff, not_applicable, yielded_with,
 };
-use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
+use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE};
 use crate::config::GooseMode;
-use crate::conversation::message::Message;
 use crate::conversation::Conversation;
+use crate::conversation::message::Message;
 use crate::hooks::HookManager;
 use crate::session::Session;
 
@@ -417,7 +417,7 @@ impl Operation<Session, GooseEffect> for SkillOperation {
                     }
                 }
                 ToolDisposition::Decline => Ok(CallToolResult::error(vec![ContentBlock::text(
-                    DECLINED_RESPONSE,
+                    APPROVAL_DENIAL_RESPONSE,
                 )])),
                 ToolDisposition::ParseError(error) => {
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(

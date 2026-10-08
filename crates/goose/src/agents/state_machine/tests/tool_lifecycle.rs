@@ -3,15 +3,15 @@ use rmcp::model::ElicitationAction;
 use serde_json::json;
 
 use super::calculator_extension::{
-    delayed_value, value, ADD, ADD_WITH_AUDIENCE, APP_ONLY, DIVIDE, REQUEST_VALUE,
+    ADD, ADD_WITH_AUDIENCE, APP_ONLY, DIVIDE, REQUEST_VALUE, delayed_value, value,
 };
-use super::pipeline::MessageKind::{Agent, Confirmation, ToolCall, ToolResponse};
 use super::pipeline::MAX_TURNS;
+use super::pipeline::MessageKind::{Agent, Confirmation, ToolCall, ToolResponse};
 use super::test_pipeline;
-use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::agents::AgentEvent;
-use crate::config::permission::PermissionLevel;
+use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE};
 use crate::config::GooseMode;
+use crate::config::permission::PermissionLevel;
 use crate::conversation::message::{Message, MessageContent};
 use crate::permission::Permission;
 
@@ -258,11 +258,12 @@ async fn approvals_and_per_tool_permissions() -> Result<()> {
 
     api.on("deny this addition")
         .calls([("denied", ADD, value(10))]);
-    api.on(DECLINED_RESPONSE).reply("I will not retry it");
+    api.on(APPROVAL_DENIAL_RESPONSE)
+        .reply("I will not retry it");
     pipeline.run(["deny this addition"]).await?;
     pipeline.confirm("denied", Permission::DenyOnce).await?;
     let result = pipeline.resume().await?;
-    result.assert_message(-2, ToolResponse, "DO NOT attempt to call this tool again");
+    result.assert_message(-2, ToolResponse, APPROVAL_DENIAL_RESPONSE);
     result.assert_message(-1, Agent, "I will not retry it");
     assert_eq!(pipeline.calculator_total(), 3);
 
@@ -272,7 +273,8 @@ async fn approvals_and_per_tool_permissions() -> Result<()> {
     pipeline
         .confirm("always-denied", Permission::AlwaysDeny)
         .await?;
-    api.on(DECLINED_RESPONSE).reply("division denied forever");
+    api.on(APPROVAL_DENIAL_RESPONSE)
+        .reply("division denied forever");
     let result = pipeline.resume().await?;
     result.assert_message(-1, Agent, "division denied forever");
 
@@ -281,7 +283,7 @@ async fn approvals_and_per_tool_permissions() -> Result<()> {
         .calls([("allowed", ADD, value(1)), ("blocked", DIVIDE, value(2))]);
     api.on("result: 4").reply("permissions applied");
     let result = pipeline.run(["apply the saved permissions"]).await?;
-    result.assert_message(-3, ToolResponse, DECLINED_RESPONSE);
+    result.assert_message(-3, ToolResponse, "blocked by permission policy");
     result.assert_message(-2, ToolResponse, "result: 4");
     result.assert_message(-1, Agent, "permissions applied");
     assert_eq!(pipeline.calculator_total(), 4);
@@ -297,10 +299,11 @@ async fn approvals_and_per_tool_permissions() -> Result<()> {
     let result = pipeline.run(["run a dangerous command"]).await?;
     result.assert_message(-1, Confirmation, "Security Alert");
 
-    api.on(DECLINED_RESPONSE).reply("the command was not run");
+    api.on(APPROVAL_DENIAL_RESPONSE)
+        .reply("the command was not run");
     pipeline.confirm("dangerous", Permission::DenyOnce).await?;
     let result = pipeline.resume().await?;
-    result.assert_message(-2, ToolResponse, DECLINED_RESPONSE);
+    result.assert_message(-2, ToolResponse, APPROVAL_DENIAL_RESPONSE);
     result.assert_message(-1, Agent, "the command was not run");
 
     Ok(())
