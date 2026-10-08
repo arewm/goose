@@ -17,8 +17,8 @@ use super::tool_confirmation_coordinator::{
 };
 use super::tool_confirmation_router::ToolConfirmationRouter;
 use super::tool_execution::{
-    tool_stream, ApprovalToolContext, ToolCallResult, ToolStream, ToolStreamItem,
-    CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
+    tool_denial_response, tool_stream, ApprovalToolContext, ToolCallResult, ToolStream,
+    ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE,
 };
 use crate::action_required_manager::ElicitationOutcome;
 use crate::agents::extension::{ExtensionConfig, ExtensionResult};
@@ -928,6 +928,7 @@ impl Agent {
         &self,
         lease: &ExtensionLease,
         permission_check_result: &PermissionCheckResult,
+        inspection_results: &[crate::tool_inspection::InspectionResult],
         request_to_response_map: &mut HashMap<String, Message>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         session: &Session,
@@ -969,20 +970,29 @@ impl Agent {
             }
         }
 
-        Self::handle_denied_tools(permission_check_result, request_to_response_map);
+        Self::handle_denied_tools(
+            permission_check_result,
+            inspection_results,
+            request_to_response_map,
+        );
         Ok(tool_futures)
     }
 
     fn handle_denied_tools(
         permission_check_result: &PermissionCheckResult,
+        inspection_results: &[crate::tool_inspection::InspectionResult],
         request_to_response_map: &mut HashMap<String, Message>,
     ) {
         for request in &permission_check_result.denied {
             if let Some(response) = request_to_response_map.get_mut(&request.id) {
+                let reason = crate::tool_inspection::denial_reason_for_request(
+                    &request.id,
+                    inspection_results,
+                );
                 response.add_tool_response_with_metadata(
                     request.id.clone(),
                     Ok(CallToolResult::error(vec![
-                        rmcp::model::ContentBlock::text(DECLINED_RESPONSE),
+                        rmcp::model::ContentBlock::text(tool_denial_response(reason.as_deref())),
                     ])),
                     request.metadata.as_ref(),
                 );
@@ -3000,6 +3010,7 @@ impl Agent {
                                     let mut tool_futures = self.handle_approved_and_denied_tools(
                                         &inference_lease,
                                         &permission_check_result,
+                                        &inspection_results,
                                         &mut request_to_response_map,
                                         cancel_token.clone(),
                                         &session,

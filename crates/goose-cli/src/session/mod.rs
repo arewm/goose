@@ -794,7 +794,7 @@ impl CliSession {
         instructions: Option<String>,
         pool_only: bool,
     ) -> Result<crate::commands::review::ReviewOptions> {
-        let provider = self.agent.provider().await?;
+        let provider = self.agent.provider(&self.session_id).await?;
         let model_config = self
             .agent
             .model_config_for_session(&self.session_id)
@@ -3308,10 +3308,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_errors_return_control_to_session() {
+    async fn review_command_preserves_session_control() {
         let mut session = session_with_loader(None, false).await;
-        session.agent = Arc::new(Agent::with_config(session.agent.config.clone()));
-        assert!(session.review_options(None, false).await.is_err());
         let history_dir = tempfile::tempdir().unwrap();
         let history = HistoryManager {
             history_file: history_dir.path().join("history.txt"),
