@@ -301,6 +301,42 @@ mod tests {
     use rmcp::object;
 
     #[test]
+    fn denial_reason_for_request_includes_denying_inspector_and_reason() {
+        let results = vec![
+            InspectionResult {
+                tool_request_id: "request-1".to_string(),
+                action: InspectionAction::Deny,
+                reason: "blocked by policy".to_string(),
+                confidence: 1.0,
+                inspector_name: "permission".to_string(),
+                finding_id: None,
+            },
+            InspectionResult {
+                tool_request_id: "request-1".to_string(),
+                action: InspectionAction::Allow,
+                reason: "allowed by policy".to_string(),
+                confidence: 1.0,
+                inspector_name: "adversary".to_string(),
+                finding_id: None,
+            },
+            InspectionResult {
+                tool_request_id: "request-2".to_string(),
+                action: InspectionAction::Deny,
+                reason: "another request".to_string(),
+                confidence: 1.0,
+                inspector_name: "adversary".to_string(),
+                finding_id: None,
+            },
+        ];
+
+        assert_eq!(
+            denial_reason_for_request("request-1", &results).as_deref(),
+            Some("permission policy: blocked by policy")
+        );
+        assert_eq!(denial_reason_for_request("request-3", &results), None);
+    }
+
+    #[test]
     fn test_apply_inspection_results() {
         let tool_request = ToolRequest {
             id: "req_1".to_string(),
