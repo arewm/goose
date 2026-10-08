@@ -4,14 +4,15 @@ use anyhow::Result;
 use async_trait::async_trait;
 use oi_kit_agent::tool_approval::{ApprovalDecision, ToolApproval};
 
-use crate::agents::tool_execution::DECLINED_RESPONSE;
+use crate::agents::tool_execution::{tool_denial_response, APPROVAL_DENIAL_RESPONSE};
 use crate::config::permission::PermissionLevel;
 use crate::conversation::message::ToolRequest;
 use crate::conversation::Conversation;
 use crate::permission::Permission;
 use crate::session::Session;
 use crate::tool_inspection::{
-    get_security_finding_id_from_results, InspectionAction, ToolInspectionManager,
+    denial_reason_for_request, get_security_finding_id_from_results, InspectionAction,
+    ToolInspectionManager,
 };
 
 pub struct GooseToolApproval<'a> {
@@ -70,9 +71,10 @@ impl ToolApproval<Session> for GooseToolApproval<'_> {
             .iter()
             .map(|request| {
                 if denied.contains(request.id.as_str()) {
-                    return ApprovalDecision::Deny {
-                        reason: DECLINED_RESPONSE.to_string(),
-                    };
+                    let reason = denial_reason_for_request(&request.id, &inspection_results)
+                        .map(|reason| tool_denial_response(Some(&reason)))
+                        .unwrap_or_else(|| APPROVAL_DENIAL_RESPONSE.to_string());
+                    return ApprovalDecision::Deny { reason };
                 }
                 if !needs_approval.contains(request.id.as_str()) {
                     return ApprovalDecision::Allow;

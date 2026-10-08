@@ -421,22 +421,15 @@ impl RecordingHookEnv {
     }
 }
 
-const RECORD_PRE_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\nexit 0\n";
-const RECORD_RESULT_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/result.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/result.log\"\nexit 0\n";
-const RECORD_POST_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/post.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/post.log\"\nexit 0\n";
-const RECORD_POST_FAILURE_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/postfail.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/postfail.log\"\nexit 0\n";
-const RECORD_EXTENDED_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/extended.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/extended.log\"\nexit 0\n";
-const DENY_AND_RECORD_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho \"blocked by test policy\" >&2\nexit 2\n";
+const RECORD_PRE_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\nexit 0\n";
+const RECORD_RESULT_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/result.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/result.log\"\nexit 0\n";
+const RECORD_POST_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/post.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/post.log\"\nexit 0\n";
+const RECORD_POST_FAILURE_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/postfail.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/postfail.log\"\nexit 0\n";
+const RECORD_EXTENDED_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/extended.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/extended.log\"\nexit 0\n";
+const DENY_AND_RECORD_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho \"blocked by test policy\" >&2\nexit 2\n";
 /// Logs its stdin like the others, writes nothing to stdout, and exits
 /// non-zero. That is a hook that ran but never returned a decision.
-const ABNORMAL_EXIT_AND_RECORD_SCRIPT: &str =
-    "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho boom >&2\nexit 3\n";
+const ABNORMAL_EXIT_AND_RECORD_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho boom >&2\nexit 3\n";
 const HOOK_FAILURE_REFUSAL: &str =
     "Tool call blocked because policy hook `test-plugin` could not complete: \
      the hook exited with status 3 and no usable decision. \

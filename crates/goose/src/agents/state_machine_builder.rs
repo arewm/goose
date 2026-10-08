@@ -28,7 +28,7 @@ use crate::agents::state_machine::{
     UnhandledToolCallsOperation, NO_SKILLS_HELP,
 };
 use crate::agents::subagent_handler::ForegroundSubagentRunner;
-use crate::agents::tool_execution::DECLINED_RESPONSE;
+use crate::agents::tool_execution::APPROVAL_DENIAL_RESPONSE;
 use crate::agents::tool_snapshot::ToolSnapshot;
 use crate::agents::StateMachineServices;
 use crate::config::Config;
@@ -178,7 +178,7 @@ pub(crate) fn build_state_machine(
         ) as Arc<dyn Operation<_, _>>,
         Arc::new(
             ToolApprovalOperation::new(Arc::new(GooseToolApproval::new(tool_inspection_manager)))
-                .with_declined_message(DECLINED_RESPONSE),
+                .with_declined_message(APPROVAL_DENIAL_RESPONSE),
         ),
         Arc::clone(&skills),
         Arc::new(RecipeOperation::new(Arc::clone(&services))),
