@@ -10,17 +10,18 @@ use tracing_futures::Instrument;
 use crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
 use crate::agents::state_machine::effects::GooseEffect;
 use crate::agents::state_machine::ops_toolcalling::{
-    emit_extended_pre_hooks, emit_post_tool_use, pending_tool_requests, request_was_advertised,
-    run_pre_tool_hooks, tool_span, ToolDisposition,
+    ToolDisposition, emit_extended_pre_hooks, emit_post_tool_use, pending_tool_requests,
+    request_was_advertised, run_pre_tool_hooks, tool_span,
 };
 use crate::agents::state_machine::{
     applied, messages_since_kickoff, not_applicable, pending_tool_confirmations, yielded, Emitter,
     Operation, OperationResult,
 };
-use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
+use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE};
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
 use crate::conversation::Conversation;
+use crate::conversation::message::Message;
 use crate::hooks::HookManager;
 use crate::session::Session;
 
@@ -151,8 +152,7 @@ impl Operation<Session, GooseEffect> for RemainingToolCallsOperation {
                     )])),
                     false,
                 ),
-                ToolDisposition::Execute => {
-                    match request.tool_call.as_ref() {
+                ToolDisposition::Execute => match request.tool_call.as_ref() {
                         Ok(tool_call) => {
                             let tool_input = tool_call
                                 .arguments
@@ -178,8 +178,8 @@ impl Operation<Session, GooseEffect> for RemainingToolCallsOperation {
                                     )
                                     .instrument(span.clone())
                                     .await;
-                                    let (output, unclaimed) =
-                                        if tool_call.name == FINAL_OUTPUT_TOOL_NAME
+                                let (output, unclaimed) = if tool_call.name
+                                    == FINAL_OUTPUT_TOOL_NAME
                                             && !active_final_output
                                         {
                                             span.record("error.type", "final_output_not_defined");
@@ -194,12 +194,9 @@ impl Operation<Session, GooseEffect> for RemainingToolCallsOperation {
                                         } else {
                                             span.record("error.type", "tool_not_available");
                                             (
-                                                Ok(CallToolResult::error(vec![
-                                                    ContentBlock::text(format!(
-                                                        "Tool '{}' is not available.",
-                                                        tool_call.name
-                                                    )),
-                                                ])),
+                                        Ok(CallToolResult::error(vec![ContentBlock::text(
+                                            format!("Tool '{}' is not available.", tool_call.name),
+                                        )])),
                                                 true,
                                             )
                                         };
@@ -224,11 +221,10 @@ impl Operation<Session, GooseEffect> for RemainingToolCallsOperation {
                             ))])),
                             false,
                         ),
-                    }
-                }
+                },
                 ToolDisposition::Decline => (
                     Ok(CallToolResult::error(vec![ContentBlock::text(
-                        DECLINED_RESPONSE,
+                        APPROVAL_DENIAL_RESPONSE,
                     )])),
                     false,
                 ),

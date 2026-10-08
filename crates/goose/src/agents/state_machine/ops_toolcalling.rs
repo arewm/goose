@@ -15,7 +15,8 @@ use crate::agents::state_machine::{
     GooseEffect, Operation, OperationResult, SlashCommand,
 };
 use crate::agents::tool_execution::{
-    tool_stream, ToolCallResult, ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
+    denial_reason_from_request, tool_denial_response, tool_stream, ToolCallResult, ToolStreamItem,
+    APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE,
 };
 use crate::agents::AgentEvent;
 use crate::config::GooseMode;
@@ -949,7 +950,11 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation {
                         CallToolResult::error(vec![ContentBlock::text(EXPIRED_APPROVAL_RESPONSE)])
                     }
                     ToolDisposition::Decline => CallToolResult::error(vec![ContentBlock::text(
-                        DECLINED_RESPONSE,
+                        if let Some(reason) = denial_reason_from_request(&request) {
+                            tool_denial_response(Some(reason))
+                        } else {
+                            APPROVAL_DENIAL_RESPONSE.to_string()
+                        },
                     )]),
                     ToolDisposition::ParseError(parse_error) => {
                         CallToolResult::error(vec![ContentBlock::text(format!(
@@ -1050,7 +1055,11 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation {
                     batch.record(
                         &request.id,
                         Ok(CallToolResult::error(vec![ContentBlock::text(
-                            DECLINED_RESPONSE,
+                            if let Some(reason) = denial_reason_from_request(request) {
+                                tool_denial_response(Some(reason))
+                            } else {
+                                APPROVAL_DENIAL_RESPONSE.to_string()
+                            },
                         )])),
                         request.metadata.as_ref(),
                     );
