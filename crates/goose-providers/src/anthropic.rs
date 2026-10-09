@@ -397,7 +397,12 @@ impl Provider for AnthropicProvider {
                     .collect());
             }
             match self.fetch_models_from_api().await {
-                Ok(models) => return Ok(models),
+                Ok(mut models) => {
+                    models.extend(custom_models.iter().map(|model| model.name.clone()));
+                    models.sort();
+                    models.dedup();
+                    return Ok(models);
+                }
                 Err(e) if e.is_endpoint_not_found() => {
                     tracing::debug!(
                         "Models endpoint not implemented for provider '{}' ({}), using predefined list",
@@ -716,6 +721,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_supported_models_unions_dynamic_and_configured_models() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for discovered in [
+            json!([{"id": "z-discovered"}, {"id": "shared"}, {"id": "z-discovered"}]),
+            json!([]),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": discovered
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let mut provider = make_provider_with_custom_models(&server.uri(), vec![]);
+            provider.custom_models = Some(vec![
+                ModelInfo {
+                    reasoning: true,
+                    ..ModelInfo::new("shared").with_context_limit(8192)
+                },
+                ModelInfo::new("a-configured").with_context_limit(4096),
+                ModelInfo::new("a-configured").with_context_limit(4096),
+            ]);
+            let expected = if discovered.as_array().unwrap().is_empty() {
+                vec!["a-configured", "shared"]
+            } else {
+                vec!["a-configured", "shared", "z-discovered"]
+            };
+            assert_eq!(provider.fetch_supported_models().await.unwrap(), expected);
+
+            let info = provider.fetch_supported_model_info().await.unwrap();
+            assert_eq!(
+                info.iter()
+                    .map(|model| model.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let shared = info.iter().find(|model| model.name == "shared").unwrap();
+            assert_eq!(shared.context_limit, Some(8192));
+            assert!(shared.reasoning);
+            let configured = info
+                .iter()
+                .find(|model| model.name == "a-configured")
+                .unwrap();
+            assert_eq!(configured.context_limit, Some(4096));
+        }
+    }
+
+    #[tokio::test]
     async fn fetch_supported_models_falls_back_on_invalid_payload() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -812,7 +870,7 @@ mod tests {
 
         assert_eq!(
             provider.fetch_supported_models().await.unwrap(),
-            vec!["model-a".to_string()]
+            vec!["model-a".to_string(), "static-model".to_string()]
         );
     }
 
