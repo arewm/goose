@@ -20,9 +20,10 @@ use super::base::{
 };
 pub use super::formats::anthropic::AnthropicFormatOptions;
 use super::formats::anthropic::{
-    block_binding_behavior, create_request_for_model, is_reserved_request_param_key,
-    is_thinking_signature_error, response_to_streaming_message, PrefixMismatchBehavior,
-    ANTHROPIC_PROVIDER_NAME, INPUT_TRANSFORMATIONS_FIELD, THINKING_BINDING_CONTROLS_BETA,
+    block_binding_behavior, create_request_for_model, is_not_multimodal_error,
+    is_reserved_request_param_key, is_thinking_signature_error, response_to_streaming_message,
+    PrefixMismatchBehavior, ANTHROPIC_PROVIDER_NAME, INPUT_TRANSFORMATIONS_FIELD,
+    THINKING_BINDING_CONTROLS_BETA,
 };
 use super::openai_compatible::handle_status;
 use super::retry::ProviderRetry;
@@ -53,6 +54,11 @@ pub struct AnthropicProvider {
     skip_canonical_filtering: bool,
     #[serde(skip)]
     format_options: AnthropicFormatOptions,
+    /// Models that rejected a payload because they cannot accept images.
+    /// Remembered so later requests for the same model strip images up front
+    /// instead of paying a failed request each turn.
+    #[serde(skip)]
+    image_rejecting_models: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Builder for [`AnthropicProvider`].
@@ -141,6 +147,7 @@ impl AnthropicProviderBuilder {
             dynamic_models: self.dynamic_models,
             skip_canonical_filtering: self.skip_canonical_filtering,
             format_options: self.format_options,
+            image_rejecting_models: std::sync::Mutex::default(),
         }
     }
 }
@@ -208,19 +215,28 @@ impl AnthropicProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        let mut format_options = self.format_options.clone();
+        if self
+            .image_rejecting_models
+            .lock()
+            .expect("image_rejecting_models poisoned")
+            .contains(&model_config.model_name)
+        {
+            format_options.strip_images = true;
+        }
         let payload = self.streaming_payload(
             model_config,
             wire_model,
             system,
             messages,
             tools,
-            self.format_options.clone(),
+            format_options.clone(),
         )?;
         let mut log = start_log(model_config, &payload)?;
         let response = match self.post_messages(model_config, &payload).await {
             Err(ProviderError::RequestFailed(message))
                 if is_thinking_signature_error(&message)
-                    && !self.format_options.strip_thinking_history
+                    && !format_options.strip_thinking_history
                     && block_binding_behavior(&payload) != Some(PrefixMismatchBehavior::Error) =>
             {
                 tracing::warn!(
@@ -231,7 +247,33 @@ impl AnthropicProvider {
                 let _ = log.error(&message);
                 let stripped = AnthropicFormatOptions {
                     strip_thinking_history: true,
-                    ..self.format_options.clone()
+                    ..format_options.clone()
+                };
+                let payload =
+                    self.streaming_payload(model_config, wire_model, system, messages, tools, stripped)?;
+                log = start_log(model_config, &payload)?;
+                self.post_messages(model_config, &payload).await
+            }
+            Err(ProviderError::RequestFailed(message))
+                if is_not_multimodal_error(&message)
+                    && !format_options.strip_images
+                    && payload_contains_images(&payload) =>
+            {
+                tracing::warn!(
+                    error = %message,
+                    model = %model_config.model_name,
+                    "API rejected image content for a non-multimodal model; retrying once with \
+                     images replaced by text placeholders. The images stay in the session, so \
+                     this model keeps receiving placeholders on later requests"
+                );
+                let _ = log.error(&message);
+                self.image_rejecting_models
+                    .lock()
+                    .expect("image_rejecting_models poisoned")
+                    .insert(model_config.model_name.clone());
+                let stripped = AnthropicFormatOptions {
+                    strip_images: true,
+                    ..format_options.clone()
                 };
                 let payload =
                     self.streaming_payload(model_config, wire_model, system, messages, tools, stripped)?;
@@ -446,6 +488,19 @@ impl Provider for AnthropicProvider {
             tools,
         )
         .await
+    }
+}
+
+/// Whether the serialized request payload carries any image blocks. Retrying
+/// with images stripped can only help when images are actually present.
+fn payload_contains_images(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("type").and_then(Value::as_str) == Some("image")
+                || map.values().any(payload_contains_images)
+        }
+        Value::Array(items) => items.iter().any(payload_contains_images),
+        _ => false,
     }
 }
 
@@ -668,6 +723,7 @@ mod tests {
             dynamic_models: Some(true),
             skip_canonical_filtering: false,
             format_options: AnthropicFormatOptions::default(),
+            image_rejecting_models: std::sync::Mutex::default(),
         }
     }
 
@@ -874,6 +930,150 @@ mod tests {
         assert!(
             matches!(err, ProviderError::Authentication(_)),
             "expected Authentication error, got: {:?}",
+            err
+        );
+    }
+
+    fn image_sse_body() -> String {
+        concat!(
+            r#"data: {"type":"message_start","message":{"id":"msg_1","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n",
+        )
+        .to_string()
+    }
+
+    fn not_multimodal_error_body() -> serde_json::Value {
+        json!({
+            "type": "error",
+            "error": {
+                "type": "BadRequestError",
+                "message": "zai-org/GLM-5.3 is not a multimodal model"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn not_multimodal_400_retries_once_with_images_stripped() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The image-bearing payload is rejected...
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_string_contains("\"type\":\"image\""))
+            .respond_with(ResponseTemplate::new(400).set_body_json(not_multimodal_error_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // ...and the retry, with images replaced by placeholders, succeeds.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_string_contains(
+                "[image omitted: model does not support vision]",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(image_sse_body())
+                    .append_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = make_provider_with_custom_models(&server.uri(), vec!["glm-5.3".to_string()]);
+        let messages = vec![Message::user()
+            .with_text("what is this?")
+            .with_content(MessageContent::image("aGVsbG8=", "image/png"))];
+
+        let (message, _) = provider
+            .complete(&ModelConfig::new("glm-5.3"), "system", &messages, &[])
+            .await
+            .expect("retry with stripped images should succeed");
+
+        assert!(message.as_concat_text().contains("ok"));
+    }
+
+    #[tokio::test]
+    async fn remembered_model_strips_images_without_a_failed_request() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_string_contains("\"type\":\"image\""))
+            .respond_with(ResponseTemplate::new(400).set_body_json(not_multimodal_error_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(body_string_contains(
+                "[image omitted: model does not support vision]",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(image_sse_body())
+                    .append_header("content-type", "text/event-stream"),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = make_provider_with_custom_models(&server.uri(), vec!["glm-5.3".to_string()]);
+        let messages = vec![Message::user()
+            .with_text("what is this?")
+            .with_content(MessageContent::image("aGVsbG8=", "image/png"))];
+
+        // First call: one rejected request, then the stripped retry succeeds.
+        provider
+            .complete(&ModelConfig::new("glm-5.3"), "system", &messages, &[])
+            .await
+            .expect("retry with stripped images should succeed");
+        // Second call: the model is remembered, so the payload is stripped up
+        // front — no additional 400.
+        provider
+            .complete(&ModelConfig::new("glm-5.3"), "system", &messages, &[])
+            .await
+            .expect("remembered model should strip images up front");
+    }
+
+    #[tokio::test]
+    async fn not_multimodal_400_without_images_surfaces_the_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A rejection with no images to strip must not be retried: the error
+        // surfaces to the caller instead of looping.
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(not_multimodal_error_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = make_provider_with_custom_models(&server.uri(), vec!["glm-5.3".to_string()]);
+
+        let err = provider
+            .complete(
+                &ModelConfig::new("glm-5.3"),
+                "system",
+                &[Message::user().with_text("hi")],
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::RequestFailed(ref message) if message.contains("not a multimodal model")),
+            "expected the original RequestFailed to surface, got: {:?}",
             err
         );
     }
