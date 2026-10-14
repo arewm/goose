@@ -68,6 +68,10 @@ pub struct AnthropicFormatOptions {
     pub cache_ttl: Option<CacheTtl>,
     pub prefix_mismatch_behavior: Option<PrefixMismatchBehavior>,
     pub strip_thinking_history: bool,
+    /// Replace image content with text placeholders. Set when a provider
+    /// rejected the payload because the model cannot accept images, so the
+    /// conversation can continue without them.
+    pub strip_images: bool,
 }
 
 impl AnthropicFormatOptions {
@@ -120,6 +124,7 @@ impl AnthropicFormatOptions {
             cache_ttl,
             prefix_mismatch_behavior,
             strip_thinking_history: self.strip_thinking_history,
+            strip_images: self.strip_images,
         }
     }
 
@@ -253,6 +258,7 @@ const MEDIA_TYPE_FIELD: &str = "media_type";
 // image/svg+xml) doesn't turn the next request into a provider rejection.
 const ANTHROPIC_IMAGE_MEDIA_TYPES: [&str; 4] =
     ["image/jpeg", "image/png", "image/gif", "image/webp"];
+const STRIPPED_IMAGE_PLACEHOLDER: &str = "[image omitted: model does not support vision]";
 const EVENT_MESSAGE_START: &str = "message_start";
 const EVENT_MESSAGE_DELTA: &str = "message_delta";
 const EVENT_MESSAGE_STOP: &str = "message_stop";
@@ -363,6 +369,15 @@ fn format_messages_with_options(
                                     {
                                         let mime = mime_type.as_deref().unwrap_or("");
                                         if ANTHROPIC_IMAGE_MEDIA_TYPES.contains(&mime) {
+                                            if options.strip_images {
+                                                let marker = STRIPPED_IMAGE_PLACEHOLDER;
+                                                text_parts.push(marker.to_string());
+                                                blocks.push(json!({
+                                                    TYPE_FIELD: TEXT_TYPE,
+                                                    TEXT_TYPE: marker
+                                                }));
+                                                continue;
+                                            }
                                             has_media = true;
                                             blocks.push(json!({
                                                 TYPE_FIELD: IMAGE_TYPE,
@@ -398,7 +413,14 @@ fn format_messages_with_options(
                                     continue;
                                 }
                                 if let ContentBlock::Image(image) = c {
-                                    if ANTHROPIC_IMAGE_MEDIA_TYPES
+                                    if options.strip_images {
+                                        let marker = STRIPPED_IMAGE_PLACEHOLDER;
+                                        text_parts.push(marker.to_string());
+                                        blocks.push(json!({
+                                            TYPE_FIELD: TEXT_TYPE,
+                                            TEXT_TYPE: marker
+                                        }));
+                                    } else if ANTHROPIC_IMAGE_MEDIA_TYPES
                                         .contains(&image.mime_type.as_str())
                                     {
                                         has_media = true;
@@ -476,7 +498,14 @@ fn format_messages_with_options(
                     }
                 }
                 MessageContentBlock::Image(image) => {
-                    content.push(convert_image(image, &ImageFormat::Anthropic));
+                    if options.strip_images {
+                        content.push(json!({
+                            TYPE_FIELD: TEXT_TYPE,
+                            TEXT_TYPE: STRIPPED_IMAGE_PLACEHOLDER
+                        }));
+                    } else {
+                        content.push(convert_image(image, &ImageFormat::Anthropic));
+                    }
                 }
                 MessageContentBlock::Document(document) => {
                     if message.role != Role::User {
@@ -911,6 +940,23 @@ pub fn is_thinking_signature_error(message: &str) -> bool {
             || lower.contains("cannot be modified")
             || lower.contains("block_binding"))
 }
+
+pub fn is_not_multimodal_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    NOT_MULTIMODAL_ERROR_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+const NOT_MULTIMODAL_ERROR_MARKERS: &[&str] = &[
+    "not a multimodal model",
+    "is not multimodal",
+    "does not support image",
+    "does not support multimodal",
+    "images are not supported",
+    "image input is not supported",
+    "multimodal input is not supported",
+];
 
 pub fn create_request(
     provider_name: &str,
@@ -2280,6 +2326,89 @@ mod tests {
         let spec = format_messages(&messages);
 
         assert_eq!(spec[1]["content"][0]["content"], "[Image: image/svg+xml]");
+    }
+
+    #[test]
+    fn strip_images_replaces_tool_response_images_with_placeholder() {
+        use rmcp::model::CallToolResult;
+
+        let raw_image = ContentBlock::image("aGVsbG8=", "image/png");
+        let resource_image = ContentBlock::resource(ResourceContents::BlobResourceContents {
+            uri: "file:///shot.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+            blob: "aGVsbG8=".to_string(),
+            meta: None,
+        });
+
+        let messages = vec![
+            Message::assistant()
+                .with_tool_request("tool_1", Ok(CallToolRequestParams::new("read_image"))),
+            Message::user().with_tool_response(
+                "tool_1",
+                Ok(CallToolResult::success(vec![raw_image, resource_image])),
+            ),
+        ];
+
+        let opts = AnthropicFormatOptions {
+            strip_images: true,
+            ..Default::default()
+        };
+        let spec = format_messages_with_options(&messages, &opts);
+
+        // Both images collapse to a text string containing the placeholder —
+        // no image blocks may survive into the payload.
+        assert!(spec[1]["content"][0]["content"].is_string());
+        let content = spec[1]["content"][0]["content"].as_str().unwrap();
+        assert_eq!(
+            content
+                .matches("[image omitted: model does not support vision]")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn strip_images_replaces_user_image_with_text_block() {
+        let messages = vec![Message::user()
+            .with_text("what is this?")
+            .with_content(MessageContent::image("aGVsbG8=", "image/png"))];
+
+        let opts = AnthropicFormatOptions {
+            strip_images: true,
+            ..Default::default()
+        };
+        let spec = format_messages_with_options(&messages, &opts);
+
+        let blocks = spec[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "what is this?");
+        assert_eq!(
+            blocks[1]["text"],
+            "[image omitted: model does not support vision]"
+        );
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "image"),
+            "no image blocks may survive into the payload"
+        );
+    }
+
+    #[test]
+    fn is_not_multimodal_error_matches_provider_rejections() {
+        assert!(is_not_multimodal_error(
+            "zai-org/GLM-5.3 is not a multimodal model"
+        ));
+        assert!(is_not_multimodal_error(
+            "Bad request (400): model does not support image input"
+        ));
+        assert!(is_not_multimodal_error(
+            "BadRequestError: This model does not support images."
+        ));
+        assert!(!is_not_multimodal_error(
+            "Bad request (400): max_tokens is too large"
+        ));
+        assert!(!is_not_multimodal_error(
+            "thinking signature cannot be modified"
+        ));
     }
 
     #[test]
