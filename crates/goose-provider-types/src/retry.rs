@@ -87,10 +87,12 @@ impl RetryConfig {
     }
 }
 
-/// Substrings marking a `RequestFailed` (4xx) as deterministically permanent:
-/// Anthropic rejects signed `thinking`/`redacted_thinking` blocks as immutable
-/// once a thinking model's config changes mid-conversation, and the identical
-/// payload is rebuilt on every retry — so retrying can never succeed.
+/// Substrings and predicates marking a `RequestFailed` (4xx) as deterministically
+/// permanent: either Anthropic rejects signed `thinking`/`redacted_thinking`
+/// blocks as immutable once a thinking model's config changes mid-conversation,
+/// or the target model cannot accept image content at all — in both cases the
+/// identical payload is rebuilt on every retry, so retrying can never succeed.
+/// (Recovery for both happens at a higher layer that transforms the payload.)
 const PERMANENT_REQUEST_FAILURE_MARKERS: &[&str] = &[
     "blocks in the latest assistant message cannot be modified",
     "must remain as they were in the original response",
@@ -102,6 +104,7 @@ fn is_permanent_request_failure(message: &str) -> bool {
         .iter()
         .any(|marker| message.contains(marker))
         || crate::formats::anthropic::is_thinking_signature_error(message)
+        || crate::formats::anthropic::is_not_multimodal_error(message)
 }
 
 pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
@@ -289,6 +292,15 @@ mod tests {
              modified. These blocks must remain as they were in the original \
              response.\"}"
                 .into(),
+        );
+        assert!(!should_retry(&error, &config));
+    }
+
+    #[test]
+    fn never_retries_permanent_not_multimodal_400() {
+        let config = RetryConfig::default();
+        let error = ProviderError::RequestFailed(
+            "Bad request (400): zai-org/GLM-5.3 is not a multimodal model".into(),
         );
         assert!(!should_retry(&error, &config));
     }

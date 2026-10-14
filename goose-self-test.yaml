@@ -416,6 +416,18 @@ prompt: |
   2. Verify it responds gracefully (either with a placeholder message or a clear error),
      not with a crash or FFI error.
 
+  ### Non-Multimodal Model Recovery Test (Anthropic-format providers)
+  **Prerequisites**: The session must run an Anthropic-messages-format provider whose active
+  model rejects images (e.g. a LiteLLM gateway fronting `zai-org/GLM-5.3`, which returns
+  `400 ... is not a multimodal model`). Skip this phase if the active model accepts images.
+
+  1. Ask the model to `read_image` on any local PNG.
+  2. Verify the turn does not end with `Ran into this error: Request failed: Bad request (400)`.
+     The provider retries once with images replaced by
+     `[image omitted: model does not support vision]` placeholders, and the model replies.
+  3. Send another message in the same session and verify it also succeeds (the provider
+     remembers the model rejects images and strips them up front).
+
   Log results to: {{ workspace_dir }}/phase3b_vision.md
   {% endif %}
 
