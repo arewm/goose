@@ -526,7 +526,7 @@ impl SummonClient {
                 },
                 "working_dir": {
                     "type": "string",
-                    "description": "Working directory for the delegate. Must be within the parent session's working directory. Defaults to the parent's working directory."
+                    "description": "Working directory for the delegate. Must be within the parent session's working directory or one of its registered additional working directories. Defaults to the parent's working directory."
                 },
                 "resume": {
                     "type": "string",
@@ -1304,7 +1304,7 @@ impl SummonClient {
         }
 
         let effective_working_dir = match &params.working_dir {
-            Some(dir) => resolve_working_dir(&session.working_dir, dir)?,
+            Some(dir) => resolve_working_dir(&session.working_dir, dir, extra_working_dirs())?,
             None => session.working_dir.clone(),
         };
 
@@ -1575,10 +1575,61 @@ impl McpClientTrait for SummonClient {
     }
 }
 
+/// Extra working directory roots that delegated subagents may run in,
+/// beyond the parent session's working directory. Registered once at CLI
+/// startup via [`register_extra_working_dirs`]. Process-global because
+/// subagents run in-process; deliberately launch-scoped and not persisted
+/// with the session, so a resumed session must re-register them.
+static EXTRA_WORKING_DIRS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Register additional working directory roots that delegated subagents may
+/// run in, beyond the parent session's working directory.
+///
+/// This widens the delegate sandbox, so only interactive, human-launched
+/// sessions may call it: the caller is responsible for verifying that stdin
+/// and stdout are terminals before invoking this function. Paths are
+/// canonicalized (symlinks are resolved) and must be existing directories.
+/// Calling this more than once is a no-op after the first registration.
+pub fn register_extra_working_dirs(dirs: Vec<PathBuf>) -> Result<(), anyhow::Error> {
+    if EXTRA_WORKING_DIRS.get().is_some() {
+        return Ok(());
+    }
+    let mut canonical = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let path = dir.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "additional working directory '{}' could not be resolved: {}",
+                dir.display(),
+                e
+            )
+        })?;
+        if !path.is_dir() {
+            anyhow::bail!(
+                "additional working directory '{}' is not a directory",
+                dir.display()
+            );
+        }
+        canonical.push(path);
+    }
+    let _ = EXTRA_WORKING_DIRS.set(canonical);
+    Ok(())
+}
+
+/// The registered extra working directory roots (empty unless
+/// [`register_extra_working_dirs`] succeeded at startup).
+pub fn extra_working_dirs() -> &'static [PathBuf] {
+    EXTRA_WORKING_DIRS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
 /// Resolve a requested `working_dir` override against the parent session
-/// directory. Relative paths are joined to the parent dir; the result must
-/// canonicalize to an existing directory contained within the parent dir.
-fn resolve_working_dir(parent_dir: &Path, requested: &str) -> Result<PathBuf, anyhow::Error> {
+/// directory and any registered extra roots. Relative paths are joined to
+/// the parent dir; the result must canonicalize to an existing directory
+/// contained within the parent dir or one of the extra roots.
+fn resolve_working_dir(
+    parent_dir: &Path,
+    requested: &str,
+    extra_roots: &[PathBuf],
+) -> Result<PathBuf, anyhow::Error> {
     let requested_path = PathBuf::from(requested);
     let resolved = if requested_path.is_absolute() {
         requested_path
@@ -1591,7 +1642,12 @@ fn resolve_working_dir(parent_dir: &Path, requested: &str) -> Result<PathBuf, an
     let parent_canonical = parent_dir
         .canonicalize()
         .unwrap_or_else(|_| parent_dir.to_path_buf());
-    if !canonical.starts_with(&parent_canonical) {
+    let inside_parent = canonical.starts_with(&parent_canonical);
+    let inside_extra_root = extra_roots.iter().any(|root| {
+        let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        canonical.starts_with(&root_canonical)
+    });
+    if !inside_parent && !inside_extra_root {
         anyhow::bail!(
             "working_dir '{}' is outside the parent session directory",
             requested
@@ -2094,7 +2150,7 @@ You review code."#;
         let subdir = parent.join("sub");
         fs::create_dir(&subdir).unwrap();
 
-        let resolved = resolve_working_dir(&parent, "sub").unwrap();
+        let resolved = resolve_working_dir(&parent, "sub", &[]).unwrap();
         assert_eq!(resolved, subdir.canonicalize().unwrap());
     }
 
@@ -2106,7 +2162,7 @@ You review code."#;
         fs::create_dir(&parent).unwrap();
         fs::create_dir(&sibling).unwrap();
 
-        let err = resolve_working_dir(&parent, "../sibling").unwrap_err();
+        let err = resolve_working_dir(&parent, "../sibling", &[]).unwrap_err();
         assert!(
             err.to_string()
                 .contains("outside the parent session directory"),
@@ -2121,7 +2177,7 @@ You review code."#;
         let file = parent.join("a.txt");
         fs::write(&file, "hello").unwrap();
 
-        let err = resolve_working_dir(&parent, "a.txt").unwrap_err();
+        let err = resolve_working_dir(&parent, "a.txt", &[]).unwrap_err();
         assert!(
             err.to_string().contains("is not a directory"),
             "unexpected error: {err}"
@@ -2133,12 +2189,40 @@ You review code."#;
         let temp_dir = TempDir::new().unwrap();
         let parent = temp_dir.path().canonicalize().unwrap();
 
-        let err = resolve_working_dir(&parent, "does-not-exist").unwrap_err();
+        let err = resolve_working_dir(&parent, "does-not-exist", &[]).unwrap_err();
         assert!(
             err.to_string().contains("could not be resolved"),
             "unexpected error: {err}"
         );
     }
+    #[test]
+    fn test_resolve_working_dir_allows_registered_extra_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent = temp_dir.path().join("parent");
+        let worktree = temp_dir.path().join("worktree");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir_all(worktree.join("nested")).unwrap();
+
+        let roots = vec![worktree.canonicalize().unwrap()];
+        let resolved = resolve_working_dir(
+            &parent,
+            &worktree.join("nested").display().to_string(),
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(resolved, worktree.join("nested").canonicalize().unwrap());
+
+        // Unregistered directories outside the parent are still rejected.
+        let other = temp_dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let err = resolve_working_dir(&parent, &other.display().to_string(), &roots).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the parent session directory"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_agent_scan_skips_non_agent_markdown() {
         let temp_dir = TempDir::new().unwrap();
