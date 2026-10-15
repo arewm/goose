@@ -21,6 +21,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use super::streaming_buffer::MarkdownBuffer;
@@ -158,42 +160,6 @@ pub fn get_show_full_tool_output() -> bool {
     SHOW_FULL_TOOL_OUTPUT.with(|s| *s.borrow())
 }
 
-// Simple wrapper around spinner to manage its state
-#[derive(Default)]
-pub struct ThinkingIndicator {
-    spinner: Option<cliclack::ProgressBar>,
-}
-
-impl ThinkingIndicator {
-    pub fn show(&mut self) {
-        let spinner = cliclack::spinner();
-        let hint = style("(Ctrl+C to interrupt)").dim();
-        if Config::global()
-            .get_param("RANDOM_THINKING_MESSAGES")
-            .unwrap_or(true)
-        {
-            spinner.start(format!(
-                "{}...  {}",
-                super::thinking::get_random_thinking_message(),
-                hint,
-            ));
-        } else {
-            spinner.start(format!("Thinking...  {}", hint));
-        }
-        self.spinner = Some(spinner);
-    }
-
-    pub fn hide(&mut self) {
-        if let Some(spinner) = self.spinner.take() {
-            spinner.stop("");
-        }
-    }
-
-    pub fn is_shown(&self) -> bool {
-        self.spinner.is_some()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PromptInfo {
     pub name: String,
@@ -202,20 +168,191 @@ pub struct PromptInfo {
     pub extension: Option<String>,
 }
 
-// Global thinking indicator
-thread_local! {
-    static THINKING: RefCell<ThinkingIndicator> = RefCell::new(ThinkingIndicator::default());
+// The session's queue, for live queue-state badges on progress output.
+// A process-wide static (not thread-local) because spinner updates can
+// fire from any async worker thread.
+static BADGE_QUEUE: std::sync::Mutex<Option<super::queue::SharedQueue>> =
+    std::sync::Mutex::new(None);
+
+/// Register the session queue so progress output can show queue state.
+pub fn set_queue(queue: super::queue::SharedQueue) {
+    *BADGE_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(queue);
 }
 
-pub fn show_thinking() {
-    if std::io::stdout().is_terminal() {
-        THINKING.with(|t| t.borrow_mut().show());
+/// A dim badge showing queued-message count and hold state, or an empty
+/// string when nothing is queued (or no queue is registered).
+fn queue_badge() -> String {
+    let guard = BADGE_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(queue) = guard.as_ref() else {
+        return String::new();
+    };
+    let count = queue.len();
+    if count == 0 {
+        return String::new();
+    }
+    if queue.is_held() {
+        format!("  {}", style(format!("+{count} queued · held")).yellow())
+    } else {
+        format!("  {}", style(format!("+{count} queued")).dim())
     }
 }
 
+// ── Typing-aware progress rendering ─────────────────────────────────────
+//
+// Spinners and progress bars redraw relative to the terminal cursor.
+// When the type-ahead reader echoes keystrokes, the cursor moves and
+// every animated redraw smears a copy of the frame across the input
+// line. To keep typing and progress output coexisting:
+//
+//   - every keystroke the reader sees opens a "mute window";
+//   - while the window is open, the animation ticker stops redrawing;
+//   - once typing has been idle for PROGRESS_RESUME_AFTER_MS, the
+//     ticker resumes and the spinners animate again.
+//
+// The reader additionally erases and redraws its input line around the
+// window (see session::queue), so a resumed spinner always starts from
+// a clean line.
+
+/// Resume animated progress output after this much typing idle.
+pub const PROGRESS_RESUME_AFTER_MS: u64 = 1000;
+/// The reader releases its input line slightly before the spinner
+/// resumes, so the first resumed frame never lands on a line the
+/// reader still owns.
+pub const READER_RELEASE_LINE_AFTER_MS: u64 = 900;
+
+static LAST_KEYSTROKE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn last_keystroke_ms() -> u64 {
+    LAST_KEYSTROKE_MS.load(Ordering::Acquire)
+}
+
+/// Record reader activity, (re)opening the mute window.
+pub fn note_reader_keystroke() {
+    LAST_KEYSTROKE_MS.store(now_ms(), Ordering::Release);
+}
+
+/// Whether animated progress redraws are suppressed (typing recently).
+pub fn progress_muted() -> bool {
+    let last = last_keystroke_ms();
+    last != 0 && now_ms().saturating_sub(last) < PROGRESS_RESUME_AFTER_MS
+}
+
+/// Whether the reader should hand its input line back to progress
+/// output (typing idle long enough that the spinner is about to
+/// resume).
+pub fn reader_should_release_line() -> bool {
+    let last = last_keystroke_ms();
+    last != 0 && now_ms().saturating_sub(last) >= READER_RELEASE_LINE_AFTER_MS
+}
+
+/// Bars driven by the shared ticker, keyed by registration id
+/// (ProgressBar has no identity comparison). Registered bars animate
+/// while progress is not muted.
+static TICKED_BARS: Mutex<Vec<(u64, ProgressBar)>> = Mutex::new(Vec::new());
+
+fn lock_ticked_bars() -> std::sync::MutexGuard<'static, Vec<(u64, ProgressBar)>> {
+    TICKED_BARS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A single background thread that animates all registered bars,
+/// pausing while the reader's mute window is open.
+static TICKER: OnceLock<()> = OnceLock::new();
+
+fn ensure_ticker() {
+    TICKER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("progress-ticker".into())
+            .spawn(|| loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if progress_muted() {
+                    continue;
+                }
+                for (_, bar) in lock_ticked_bars().iter() {
+                    bar.tick();
+                }
+            })
+            .expect("spawn progress ticker");
+    });
+}
+
+/// Fresh registration id for a bar.
+fn fresh_bar_id() -> u64 {
+    static NEXT_BAR_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_BAR_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn register_ticked(id: u64, bar: ProgressBar) {
+    ensure_ticker();
+    let mut bars = lock_ticked_bars();
+    if !bars.iter().any(|(existing, _)| *existing == id) {
+        bars.push((id, bar));
+    }
+}
+
+fn unregister_ticked(id: u64) {
+    lock_ticked_bars().retain(|(existing, _)| *existing != id);
+}
+
+// ── Global thinking indicator ───────────────────────────────────────────
+//
+// A process-wide indicatif spinner (not thread-local, not cliclack) so
+// that show/hide work from any thread and the animation goes through
+// the mute-gated ticker above.
+static THINKING_SPINNER: Mutex<Option<(u64, ProgressBar)>> = Mutex::new(None);
+
+fn lock_thinking() -> std::sync::MutexGuard<'static, Option<(u64, ProgressBar)>> {
+    THINKING_SPINNER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub fn show_thinking() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let hint = style("(Ctrl+C to interrupt)").dim();
+    let message = if Config::global()
+        .get_param("RANDOM_THINKING_MESSAGES")
+        .unwrap_or(true)
+    {
+        format!(
+            "{}...  {}{}",
+            super::thinking::get_random_thinking_message(),
+            hint,
+            queue_badge()
+        )
+    } else {
+        format!("Thinking...  {}{}", hint, queue_badge())
+    };
+    let bar = ProgressBar::new_spinner()
+        .with_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap()
+                .tick_chars("◒◓◐"),
+        )
+        .with_message(message);
+    let id = fresh_bar_id();
+    register_ticked(id, bar.clone());
+    *lock_thinking() = Some((id, bar));
+}
+
 pub fn hide_thinking() {
-    if std::io::stdout().is_terminal() {
-        THINKING.with(|t| t.borrow_mut().hide());
+    if let Some((id, bar)) = lock_thinking().take() {
+        unregister_ticked(id);
+        bar.finish_with_message(String::new());
     }
 }
 
@@ -287,16 +424,15 @@ pub fn run_status_hook(status: &str) {
 }
 
 pub fn is_showing_thinking() -> bool {
-    THINKING.with(|t| t.borrow().is_shown())
+    lock_thinking().is_some()
 }
 
 pub fn set_thinking_message(s: &String) {
-    if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            if let Some(spinner) = t.borrow_mut().spinner.as_mut() {
-                spinner.set_message(s);
-            }
-        });
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    if let Some((_, spinner)) = lock_thinking().as_ref() {
+        spinner.set_message(format!("{s}{}", queue_badge()));
     }
 }
 
@@ -1600,7 +1736,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
     }
 
     println!(
-        "  {} {} {}",
+        "  {} {} {}{}",
         colored_bar,
         style(format!("{}%", percentage)).dim(),
         style(format!(
@@ -1609,6 +1745,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
             format_tokens(context_limit)
         ))
         .dim(),
+        queue_badge(),
     );
 }
 
@@ -1645,7 +1782,7 @@ pub fn display_cost_usage(provider: &str, model: &str, usage: &Usage) {
 
 pub struct McpSpinners {
     bars: HashMap<String, ProgressBar>,
-    log_spinner: Option<ProgressBar>,
+    log_spinner: Option<(u64, ProgressBar)>,
     shell_output_lines: VecDeque<String>,
     multi_bar: MultiProgress,
 }
@@ -1661,7 +1798,7 @@ impl McpSpinners {
     }
 
     pub fn log(&mut self, message: &str) {
-        let spinner = self.log_spinner.get_or_insert_with(|| {
+        if self.log_spinner.is_none() {
             let bar = self.multi_bar.add(
                 ProgressBar::new_spinner()
                     .with_style(
@@ -1669,13 +1806,14 @@ impl McpSpinners {
                             .unwrap()
                             .tick_chars("⠋⠙⠚⠛⠓⠒⠊⠉"),
                     )
-                    .with_message(message.to_string()),
+                    .with_message(format!("{message}{}", queue_badge())),
             );
-            bar.enable_steady_tick(Duration::from_millis(100));
-            bar
-        });
-
-        spinner.set_message(message.to_string());
+            self.log_spinner = Some((fresh_bar_id(), bar));
+        }
+        if let Some((id, spinner)) = self.log_spinner.as_ref() {
+            register_ticked(*id, spinner.clone());
+            spinner.set_message(format!("{message}{}", queue_badge()));
+        }
     }
 
     pub fn log_shell_output(&mut self, lines: Vec<String>, max_lines: usize) {
@@ -1700,19 +1838,27 @@ impl McpSpinners {
         });
         bar.set_position((value * 100_f64) as u64);
         if let Some(msg) = message {
-            bar.set_message(msg.to_string());
+            bar.set_message(format!("{msg}{}", queue_badge()));
         }
     }
 
     pub fn hide(&mut self) -> Result<(), Error> {
-        self.bars.iter_mut().for_each(|(_, bar)| {
-            bar.disable_steady_tick();
-        });
-        if let Some(spinner) = self.log_spinner.as_mut() {
-            spinner.disable_steady_tick();
+        if let Some((id, _)) = self.log_spinner.as_ref() {
+            unregister_ticked(*id);
         }
         self.shell_output_lines.clear();
         self.multi_bar.clear()
+    }
+}
+
+impl Drop for McpSpinners {
+    fn drop(&mut self) {
+        // The registry's clone keeps the bar alive beyond this
+        // McpSpinners; without this the shared ticker would keep
+        // redrawing an orphaned spinner after the turn ends.
+        if let Some((id, _)) = self.log_spinner.as_ref() {
+            unregister_ticked(*id);
+        }
     }
 }
 
@@ -1749,6 +1895,77 @@ mod tests {
         }
 
         assert_eq!(rendered, "two\n  three\n  four");
+    }
+
+    #[test]
+    fn mute_window_opens_on_keystroke_and_expires_with_idle() {
+        // No keystroke yet: nothing muted, nothing to release.
+        LAST_KEYSTROKE_MS.store(0, Ordering::Release);
+        assert!(!progress_muted());
+        assert!(!reader_should_release_line());
+
+        note_reader_keystroke();
+        assert!(progress_muted());
+        assert!(!reader_should_release_line());
+
+        // Line release happens strictly before progress resumes.
+        let now = now_ms();
+        LAST_KEYSTROKE_MS.store(now - READER_RELEASE_LINE_AFTER_MS, Ordering::Release);
+        assert!(
+            progress_muted(),
+            "still inside the mute window at release time"
+        );
+        assert!(reader_should_release_line());
+
+        LAST_KEYSTROKE_MS.store(now - PROGRESS_RESUME_AFTER_MS, Ordering::Release);
+        assert!(!progress_muted());
+        assert!(reader_should_release_line());
+
+        // A keystroke mid-window re-opens it.
+        LAST_KEYSTROKE_MS.store(now - 200, Ordering::Release);
+        note_reader_keystroke();
+        assert!(progress_muted());
+        LAST_KEYSTROKE_MS.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn ticked_bar_registry_dedupes_and_unregisters() {
+        let bar = ProgressBar::new_spinner();
+        let id = fresh_bar_id();
+        register_ticked(id, bar.clone());
+        register_ticked(id, bar.clone());
+        assert_eq!(
+            lock_ticked_bars().iter().filter(|(i, _)| *i == id).count(),
+            1
+        );
+        let other = fresh_bar_id();
+        register_ticked(other, ProgressBar::new_spinner());
+        assert_eq!(lock_ticked_bars().len(), 2);
+        unregister_ticked(id);
+        assert_eq!(
+            lock_ticked_bars().iter().filter(|(i, _)| *i == id).count(),
+            0
+        );
+        unregister_ticked(other);
+        assert!(lock_ticked_bars().is_empty());
+    }
+
+    #[test]
+    fn queue_badge_reflects_count_and_hold_state() {
+        let queue = super::super::queue::SharedQueue::detached();
+        set_queue(queue.clone());
+        // Empty queue: no badge at all.
+        assert_eq!(queue_badge(), "");
+        queue.enqueue("one".into());
+        queue.enqueue("two".into());
+        let badge = strip_str(&queue_badge()).to_string();
+        assert!(badge.contains("+2 queued"), "got: {badge}");
+        assert!(!badge.contains("held"), "got: {badge}");
+        queue.hold();
+        let badge = strip_str(&queue_badge()).to_string();
+        assert!(badge.contains("+2 queued · held"), "got: {badge}");
+        // Leave the global empty for other tests.
+        set_queue(super::super::queue::SharedQueue::detached());
     }
 
     #[test]

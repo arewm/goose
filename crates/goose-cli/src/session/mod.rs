@@ -6,9 +6,11 @@ mod input;
 mod output;
 mod paste;
 mod program_status;
+pub mod queue;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod tty;
 
 use crate::session::program_status::{BlockedKind, ProgramStatus};
 use crate::session::task_execution_display::{
@@ -239,6 +241,7 @@ impl HistoryManager {
 pub struct CliSession {
     agent: Arc<Agent>,
     messages: Conversation,
+    queue: queue::SharedQueue,
     session_id: String,
     completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
     debug: bool,
@@ -327,9 +330,13 @@ impl CliSession {
             }))
         });
 
+        let queue = queue::SharedQueue::load(&session_id);
+        output::set_queue(queue.clone());
+
         CliSession {
             agent,
             messages,
+            queue,
             session_id,
             completion_cache,
             debug,
@@ -614,6 +621,17 @@ impl CliSession {
         let history_manager = HistoryManager::new();
         history_manager.load(&mut editor);
 
+        if self.queue.is_held() && !self.queue.is_empty() {
+            println!(
+                "{}",
+                console::style(format!(
+                    "queue held with {} message(s) — /queue list to review, /queue resume to continue",
+                    self.queue.len()
+                ))
+                .dim()
+            );
+        }
+
         loop {
             if self
                 .extension_loading
@@ -640,15 +658,87 @@ impl CliSession {
 
             output::run_status_hook("waiting");
             program_status::report_idle();
-            let input = input::get_input(&mut editor, Some(&conversation_strings))?;
+            let draft = self.queue.take_pending_draft();
+            let input =
+                input::get_input(&mut editor, Some(&conversation_strings), draft.as_deref())?;
             if matches!(input, InputResult::Exit) {
                 break;
             }
             self.handle_input(input, &history_manager, &mut editor, &conversation_strings)
                 .await?;
+
+            // Auto-send queued messages one per turn (FIFO) behind a hold
+            // window. A held queue, or an Exit queued as a command, stops
+            // the drain.
+            if !self.drain_queue(&history_manager, &mut editor).await? {
+                break;
+            }
         }
 
         Ok(())
+    }
+
+    /// Send queued messages after a turn completes. `/queue edit`
+    /// requests made mid-turn are served first, before any message
+    /// fires. Each send is announced with a short hold window; any key
+    /// pauses the queue and returns to the prompt. Returns false when a
+    /// queued command asked to exit.
+    async fn drain_queue(
+        &mut self,
+        history: &HistoryManager,
+        editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
+    ) -> Result<bool> {
+        let mut sent = 0usize;
+        loop {
+            if self.queue.take_pending_edit() {
+                self.serve_queue_edit()?;
+            }
+            if !self.queue.ready_to_send() {
+                return Ok(true);
+            }
+            // Messages enqueued by the type-ahead reader during this
+            // drain's turns extend the run; the position counts sends in
+            // this drain.
+            let sent_so_far = sent;
+            let total = sent_so_far + self.queue.len();
+            let head = self.queue.head().expect("ready_to_send implies a head");
+            let held = queue::hold_window(sent_so_far + 1, total, &head);
+            if held {
+                self.queue.hold();
+                return Ok(true);
+            }
+            let Some(message) = self.queue.pop_head() else {
+                return Ok(true);
+            };
+            sent += 1;
+            let input = queue::interpret_queued_line(&message);
+            if matches!(input, InputResult::Exit) {
+                return Ok(false);
+            }
+            // Mirror the prompt path, which records every submitted line
+            // (messages and commands alike) in history, so queued sends
+            // are recallable with the up arrow.
+            if !message.trim().is_empty() {
+                editor.add_history_entry(message.as_str())?;
+            }
+            // Refresh the per-turn view the same way the prompt loop
+            // does, so drained turns see current conversation state.
+            self.display_context_usage().await?;
+            let conversation_strings: Vec<String> = self
+                .messages
+                .user_visible_messages()
+                .iter()
+                .map(|msg| {
+                    let role = match msg.role {
+                        rmcp::model::Role::User => "User",
+                        rmcp::model::Role::Assistant => "Assistant",
+                    };
+                    format!("## {}: {}", role, msg.as_concat_text())
+                })
+                .collect();
+            self.handle_input(input, history, editor, &conversation_strings)
+                .await?;
+        }
     }
 
     fn create_editor(
@@ -793,6 +883,67 @@ impl CliSession {
             InputResult::ListSkills => {
                 history.save(editor);
                 self.handle_list_skills().await?;
+            }
+            InputResult::QueueList => {
+                let notice = queue::interpret_queue_command(&self.queue, "/queue list");
+                println!("{}", console::style(queue::notice_text(&notice)).dim());
+            }
+            InputResult::QueueResume => {
+                let notice = queue::interpret_queue_command(&self.queue, "/queue resume");
+                println!("{}", console::style(queue::notice_text(&notice)).dim());
+            }
+            InputResult::QueueSubcommand(line) => {
+                match queue::interpret_queue_command(&self.queue, &line) {
+                    queue::QueueCommandOutcome::Notice(notice) => {
+                        println!("{}", console::style(notice).dim());
+                    }
+                    queue::QueueCommandOutcome::Browse { position } => {
+                        // The prompt cannot inject a browsed message into
+                        // the running readline; point at the mid-turn flow.
+                        let message = self.queue.message_at(position);
+                        println!(
+                            "{}",
+                            console::style(format!(
+                                "message {position} is {:?} — /queue {position} browses it for editing during a turn, /queue edit changes it here",
+                                queue::preview_line(&message.unwrap_or_default(), 60)
+                            ))
+                            .dim()
+                        );
+                    }
+                }
+            }
+            InputResult::QueueEdit => {
+                history.save(editor);
+                self.serve_queue_edit()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the queue plan in the user's editor and apply the result.
+    /// An aborted or failed edit leaves the queue untouched.
+    fn serve_queue_edit(&self) -> Result<()> {
+        // The editor needs a real terminal; park first if backgrounded.
+        tty::wait_for_foreground(None);
+        let messages = self.queue.snapshot_messages();
+        match queue::edit_queue_plan(&messages)? {
+            Some(Ok(new_messages)) => {
+                self.queue.replace_all(new_messages);
+                println!(
+                    "{}",
+                    console::style(format!("queue updated ({} messages)", self.queue.len())).dim()
+                );
+            }
+            Some(Err(error)) => {
+                // Malformed plan: keep the queue untouched, but surface
+                // the offending line so the user can retry.
+                println!(
+                    "{}",
+                    console::style(format!("queue edit not applied: {error}")).yellow()
+                );
+            }
+            None => {
+                println!("{}", console::style("queue edit aborted").dim());
             }
         }
         Ok(())
@@ -1384,6 +1535,8 @@ impl CliSession {
         }
 
         let prompt = "Are you sure you want to compact this conversation? This will condense the message history.";
+        // Prompt-time only: the type-ahead reader is not running here, so
+        // no StdinYield is needed (unlike mid-turn tool confirmations).
         let should_summarize = match cliclack::confirm(prompt).initial_value(true).interact() {
             Ok(choice) => choice,
             Err(e) => {
@@ -2612,6 +2765,13 @@ fn emit_stream_event(event: &StreamEvent) {
 fn prompt_tool_confirmation(request: &ToolConfirmationRequest) -> Result<Permission> {
     output::hide_thinking();
     output::emit_attention_bell();
+
+    // A tool confirmation can arrive mid-turn while the type-ahead
+    // reader owns stdin; yield it (the reader parks with the terminal
+    // restored) so this select receives every keystroke, and make sure
+    // we are in the foreground before prompting.
+    let _stdin_yielded = queue::StdinYield::acquire();
+    tty::wait_for_foreground(None);
 
     output::render_tool_confirmation(
         &request.tool_name,
