@@ -365,7 +365,27 @@ pub(super) fn read_paste_aware_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     paste_state: Arc<std::sync::RwLock<PasteState>>,
 ) -> rustyline::Result<String> {
-    let input = editor.readline("> ")?;
+    // A backgrounded readline is stopped with SIGTTOU (rustyline's raw-mode
+    // tcsetattr); resuming it with `fg` can surface the interrupted call as
+    // EINTR. Retrying the readline keeps the session alive instead of
+    // exiting with "Interrupted system call". Back off exponentially on
+    // consecutive interruptions so a periodic signal without SA_RESTART
+    // cannot hot-spin the loop; a genuine `fg` resume pays at most a 1ms
+    // pause before its retry.
+    let mut backoff_ms = 1u64;
+    let input = loop {
+        match editor.readline("> ") {
+            Ok(text) => break text,
+            Err(rustyline::error::ReadlineError::Io(error))
+                if error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                backoff_ms = (backoff_ms * 2).min(100);
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let expanded = paste_state
         .read()
         .ok()

@@ -119,6 +119,12 @@ pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
 ) -> Result<InputResult> {
+    // Reading the prompt controls the terminal (raw mode); doing that from a
+    // background process group stops us with SIGTTOU. Wait for the
+    // foreground first so a backgrounded goose prints a notice instead of
+    // silently hanging suspended.
+    super::tty::wait_for_foreground(None);
+
     let config = Config::global();
     let prompt_editor = config.get_goose_prompt_editor().ok().flatten();
     let editor_always_override = config.get_goose_prompt_editor_always().ok().flatten();

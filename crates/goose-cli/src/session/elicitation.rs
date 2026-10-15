@@ -44,6 +44,13 @@ pub fn collect_elicitation_input(
             "elicitation requires an interactive terminal",
         ));
     }
+    // Prompting controls the terminal (raw mode); from a background process
+    // group that stops us with SIGTTOU. Wait for the foreground first —
+    // covering the select, confirm, and free-text paths alike — and bail
+    // out if the elicitation is cancelled while parked.
+    if !crate::session::tty::wait_for_foreground(Some(cancel_token)) {
+        return Ok(cancelled_input());
+    }
     let input = collect_elicitation_input_inner(message, schema, cancel_token)?;
     if cancel_token.is_cancelled() {
         return Ok(cancelled_input());
@@ -335,6 +342,27 @@ mod cancellable_stdin {
     use std::io::Read;
     use std::os::fd::AsRawFd;
 
+    /// fcntl that retries when interrupted by a signal. A call resumed after
+    /// SIGTTOU/SIGTTIN suspension can report EINTR; treating it as fatal
+    /// kills the whole session on `fg`.
+    fn fcntl_retry(
+        fd: std::os::fd::RawFd,
+        cmd: libc::c_int,
+        arg: libc::c_int,
+    ) -> io::Result<libc::c_int> {
+        loop {
+            // SAFETY: plain fcntl on a stdin descriptor we own.
+            let result = unsafe { libc::fcntl(fd, cmd, arg) };
+            if result >= 0 {
+                return Ok(result);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
     pub(super) struct Input<'a> {
         stdin: io::StdinLock<'a>,
         original_flags: libc::c_int,
@@ -347,18 +375,13 @@ mod cancellable_stdin {
             cancel_token: &'a CancellationToken,
         ) -> io::Result<Self> {
             // Nonblocking reads close the race between readiness and a signal flushing stdin.
-            let original_flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
-            if original_flags < 0
-                || unsafe {
-                    libc::fcntl(
-                        stdin.as_raw_fd(),
-                        libc::F_SETFL,
-                        original_flags | libc::O_NONBLOCK,
-                    )
-                } < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
+            // EINTR from a resumed SIGTTOU/SIGCONT must be retried, not fatal.
+            let original_flags = fcntl_retry(stdin.as_raw_fd(), libc::F_GETFL, 0)?;
+            fcntl_retry(
+                stdin.as_raw_fd(),
+                libc::F_SETFL,
+                original_flags | libc::O_NONBLOCK,
+            )?;
             Ok(Self {
                 stdin,
                 original_flags,
@@ -368,10 +391,20 @@ mod cancellable_stdin {
 
         pub(super) fn discard_terminal_input(&self) -> io::Result<()> {
             // A programmatic SIGINT need not flush the terminal's unfinished line.
-            if self.stdin.is_terminal()
-                && unsafe { libc::tcflush(self.stdin.as_raw_fd(), libc::TCIFLUSH) } < 0
-            {
-                return Err(io::Error::last_os_error());
+            // tcflush is a terminal-control call: from a background process
+            // group it raises SIGTTOU, and a resumed call can report EINTR;
+            // retry both instead of failing the elicitation.
+            if self.stdin.is_terminal() {
+                loop {
+                    // SAFETY: tcflush only discards pending terminal input.
+                    if unsafe { libc::tcflush(self.stdin.as_raw_fd(), libc::TCIFLUSH) } == 0 {
+                        break;
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
             }
             Ok(())
         }
@@ -397,6 +430,9 @@ mod cancellable_stdin {
                 match self.stdin.fill_buf() {
                     Ok(_) => return self.stdin.fill_buf(),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    // A read interrupted by a signal (e.g. SIGCONT after a
+                    // background suspension) is retried, not surfaced.
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     Err(error) => return Err(error),
                 }
                 let mut descriptor = libc::pollfd {
@@ -405,8 +441,12 @@ mod cancellable_stdin {
                     revents: 0,
                 };
                 // StdinLock keeps input exclusively owned until the read returns.
+                // SAFETY: poll blocks only this thread for at most 50ms.
                 if unsafe { libc::poll(&mut descriptor, 1, 50) } < 0 {
-                    return Err(io::Error::last_os_error());
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -419,7 +459,8 @@ mod cancellable_stdin {
     impl Drop for Input<'_> {
         fn drop(&mut self) {
             // Restore the shared stdin description before handing input back to the CLI.
-            unsafe { libc::fcntl(self.stdin.as_raw_fd(), libc::F_SETFL, self.original_flags) };
+            // Best effort: an EINTR here is retried, anything else is ignored.
+            let _ = fcntl_retry(self.stdin.as_raw_fd(), libc::F_SETFL, self.original_flags);
         }
     }
 }

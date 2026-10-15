@@ -9,6 +9,7 @@ mod program_status;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod tty;
 
 use crate::session::program_status::{BlockedKind, ProgramStatus};
 use crate::session::task_execution_display::{
