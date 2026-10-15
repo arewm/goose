@@ -85,6 +85,20 @@ impl ProviderEntry {
         {
             model.supports_vision = Some(supports_vision);
         }
+        if let Some(auto_compact_token_limit) =
+            find_declared_model(&self.metadata.known_models, &model.model_name)
+                .and_then(|m| m.auto_compact_token_limit)
+        {
+            model.auto_compact_token_limit = Some(auto_compact_token_limit);
+        }
+        // A declared alias inherits the canonical limits (output tokens,
+        // reasoning, vision) of the model it resolves to; the alias name
+        // itself is not in the canonical registry.
+        if let Some(resolved_model) = find_declared_model(&self.metadata.known_models, &model.model_name)
+            .and_then(|declared| declared.resolved_model.clone())
+        {
+            model = model.with_alias_canonical_limits(&self.metadata.name, &resolved_model);
+        }
         crate::model_config::materialize_model_config(&self.metadata.name, model)
     }
 
@@ -254,7 +268,7 @@ impl ProviderRegistry {
             .models
             .iter()
             .map(|m| ModelInfo {
-                resolved_model: None,
+                resolved_model: m.resolved_model.clone(),
                 supports_cache_control: Some(m.supports_cache_control.unwrap_or(false)),
                 ..m.clone()
             })
@@ -561,5 +575,39 @@ mod tests {
         assert_eq!(vision.supports_vision, Some(true));
         assert_eq!(text.supports_vision, Some(false));
         assert_eq!(undeclared.supports_vision, None);
+    }
+
+    #[test]
+    fn declared_alias_inherits_resolved_model_limits() {
+        let mut registry = ProviderRegistry::new(None);
+        let mut config = test_config();
+        config.models = vec![ModelInfo {
+            resolved_model: Some("rits/zai-org/glm-5-3".to_string()),
+            ..ModelInfo::new("glm-5-3-low")
+        }];
+        registry.register_with_name::<OpenAiProviderDef, _, _>(
+            &config,
+            ProviderType::Custom,
+            false,
+            |_| unreachable!("constructor is not used by this test"),
+            || Ok(InventoryIdentityInput::new("custom_hf", "custom_hf")),
+        );
+        let entry = &registry.entries["custom_hf"];
+
+        let alias = entry
+            .normalize_model_config(ModelConfig::new("glm-5-3-low"))
+            .unwrap();
+
+        // The alias name is not in the canonical registry; it inherits the
+        // hosted model's output limit and reasoning support.
+        assert_eq!(alias.max_tokens, Some(131_072));
+        assert_eq!(alias.reasoning, Some(true));
+
+        // A model without a declared resolved_model keeps the old behavior.
+        let plain = entry
+            .normalize_model_config(ModelConfig::new("undeclared-model"))
+            .unwrap();
+        assert_eq!(plain.max_tokens, None);
+        assert_eq!(plain.reasoning, None);
     }
 }
