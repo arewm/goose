@@ -1,6 +1,6 @@
 use super::{
-    APPROVAL_DENIAL_RESPONSE, TOOL_DENIAL_REASON_KEY, TOOL_DENIAL_REASON_MAX_CHARS,
-    denial_reason_from_request, tool_denial_response,
+    denial_reason_from_request, tool_denial_response, APPROVAL_DENIAL_RESPONSE,
+    TOOL_DENIAL_REASON_KEY, TOOL_DENIAL_REASON_MAX_CHARS,
 };
 use crate::conversation::message::ToolRequest;
 use rmcp::model::CallToolRequestParams;
@@ -18,7 +18,10 @@ fn inspector_denial_explains_source_reason_and_reprompt_path() {
 
 #[test]
 fn inspector_denial_diagnostic_is_quoted_and_bounded() {
-    let reason = format!("adversary: {}", "x".repeat(TOOL_DENIAL_REASON_MAX_CHARS + 10));
+    let reason = format!(
+        "adversary: {}",
+        "x".repeat(TOOL_DENIAL_REASON_MAX_CHARS + 10)
+    );
     let message = tool_denial_response(Some(&reason));
 
     assert!(message.contains("…\""));

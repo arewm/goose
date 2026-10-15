@@ -6,6 +6,7 @@ use super::calculator_extension::{value, ADD};
 use super::pipeline::{test_pipeline, MessageKind::Agent, MessageKind::ToolResponse, MAX_TURNS};
 use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
+use crate::config::permission::PermissionLevel;
 use crate::conversation::message::{Message, MessageContent, SystemNotificationType};
 use oi_kit_agent::final_output::FINAL_OUTPUT_NOT_ALONE_MESSAGE;
 use oi_kit_agent::final_output::FINAL_OUTPUT_TOOL_NAME;

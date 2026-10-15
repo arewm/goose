@@ -911,12 +911,18 @@ mod tests {
             ("GOOSE_DISABLE_KEYRING", Some("true")),
         ]);
         let dir = tempfile::tempdir().unwrap();
-        let manager = goose::agents::extension_manager::ExtensionManager::with_data_dir(
-            dir.path().to_path_buf(),
+        let manager = Arc::new(
+            goose::agents::extension_manager::ExtensionManager::with_data_dir(
+                dir.path().to_path_buf(),
+            ),
         );
-        let lease = manager
-            .current_lease("reviewer-without-extensions", None)
-            .await;
+        let set = goose::agents::extension_manager::ExtensionSet::new(
+            "reviewer-without-extensions",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let lease = manager.resolve(&set).await;
         let tools = lease.tools().await;
         assert!(
             tools.is_empty(),

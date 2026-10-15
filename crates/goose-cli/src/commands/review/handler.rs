@@ -1170,7 +1170,11 @@ mod tests {
         run_git(&["add", "changed.txt"]);
         run_git(&["commit", "-m", "initial"]);
         fs::write(dir.path().join("changed.txt"), "after\n").unwrap();
-        fs::write(dir.path().join("HEAD"), "a path that collides with the revision\n").unwrap();
+        fs::write(
+            dir.path().join("HEAD"),
+            "a path that collides with the revision\n",
+        )
+        .unwrap();
         dir
     }
 
