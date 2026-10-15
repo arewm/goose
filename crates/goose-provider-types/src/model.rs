@@ -53,6 +53,10 @@ pub struct ModelConfig {
     pub reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_vision: Option<bool>,
+    /// Token count where auto-compaction starts for this model, overriding the
+    /// global default; goose-side policy, never sent to the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<usize>,
     /// Per-request HTTP headers attached to outgoing provider calls.
     /// Never serialized into request bodies.
     #[serde(skip)]
@@ -79,6 +83,8 @@ impl<'de> Deserialize<'de> for ModelConfig {
             reasoning: Option<bool>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             supports_vision: Option<bool>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            auto_compact_token_limit: Option<usize>,
         }
 
         let raw = RawModelConfig::deserialize(deserializer)?;
@@ -92,6 +98,7 @@ impl<'de> Deserialize<'de> for ModelConfig {
             request_params: raw.request_params,
             reasoning: raw.reasoning,
             supports_vision: raw.supports_vision,
+            auto_compact_token_limit: raw.auto_compact_token_limit,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -111,6 +118,7 @@ impl ModelConfig {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            auto_compact_token_limit: None,
             request_headers: None,
         };
         config.normalize_effort_suffix();
@@ -275,6 +283,11 @@ impl ModelConfig {
 
     pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
         self.supports_vision = Some(supports_vision);
+        self
+    }
+
+    pub fn with_auto_compact_token_limit(mut self, limit: usize) -> Self {
+        self.auto_compact_token_limit = Some(limit);
         self
     }
 
@@ -1128,17 +1141,32 @@ mod tests {
         #[test]
         fn defaults_gemini_models_to_64k() {
             let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
-            assert_eq!(ModelConfig::new("gemini-2.5-flash").max_output_tokens(), 65_536);
-            assert_eq!(ModelConfig::new("gemini-2.5-pro").max_output_tokens(), 65_536);
-            assert_eq!(ModelConfig::new("gemini-3-flash").max_output_tokens(), 65_536);
-            assert_eq!(ModelConfig::new("gemini-3-pro-preview").max_output_tokens(), 65_536);
+            assert_eq!(
+                ModelConfig::new("gemini-2.5-flash").max_output_tokens(),
+                65_536
+            );
+            assert_eq!(
+                ModelConfig::new("gemini-2.5-pro").max_output_tokens(),
+                65_536
+            );
+            assert_eq!(
+                ModelConfig::new("gemini-3-flash").max_output_tokens(),
+                65_536
+            );
+            assert_eq!(
+                ModelConfig::new("gemini-3-pro-preview").max_output_tokens(),
+                65_536
+            );
         }
 
         #[test]
         fn defaults_other_models_to_4k() {
             let _guard = env_lock::lock_env(ENV_LOCK_KEYS);
             assert_eq!(ModelConfig::new("gpt-4o").max_output_tokens(), 4_096);
-            assert_eq!(ModelConfig::new("claude-sonnet-4").max_output_tokens(), 4_096);
+            assert_eq!(
+                ModelConfig::new("claude-sonnet-4").max_output_tokens(),
+                4_096
+            );
         }
 
         #[test]
