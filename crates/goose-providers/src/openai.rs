@@ -879,6 +879,15 @@ impl Provider for OpenAiProvider {
                 },
             )?;
 
+            // A declared model may be an alias whose underlying wire model
+            // differs from its configured name (e.g. per-effort aliases that
+            // all resolve to the same hosted model).
+            if let Some(resolved) = declared_model.and_then(|m| m.resolved_model.as_deref()) {
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("model".to_string(), json!(resolved));
+                }
+            }
+
             if let Some(params) = declared_model.and_then(|m| m.request_params.as_ref()) {
                 apply_declared_request_params(&mut payload, params);
             }
@@ -1958,6 +1967,53 @@ mod tests {
             .stream(&ModelConfig::new("test-model"), "", &[], &[])
             .await
             .expect("legitimate non-streaming response should be accepted");
+    }
+
+    #[tokio::test]
+    async fn chat_resolves_declared_alias_wire_model() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The mock only answers when the alias was resolved to the hosted wire
+        // model and the alias's declared request params were applied.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(json!({
+                "model": "rits/zai-org/glm-5-3",
+                "reasoning_effort": "low"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut provider = make_provider_with_custom_models(
+            &server.uri(),
+            "v1/chat/completions",
+            vec!["glm-5-3-low".to_string()],
+        );
+        provider.supports_streaming = false;
+        provider.custom_models = Some(vec![ModelInfo {
+            resolved_model: Some("rits/zai-org/glm-5-3".to_string()),
+            request_params: Some(HashMap::from([(
+                "reasoning_effort".to_string(),
+                json!("low"),
+            )])),
+            ..ModelInfo::new("glm-5-3-low")
+        }]);
+
+        let _stream = provider
+            .stream(&ModelConfig::new("glm-5-3-low"), "", &[], &[])
+            .await
+            .expect("request should carry the resolved wire model");
     }
 
     #[tokio::test]
