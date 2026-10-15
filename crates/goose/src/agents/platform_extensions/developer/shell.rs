@@ -16,10 +16,10 @@ use crate::agents::tool_execution::ToolCallNotificationEmitter;
 use crate::subprocess::SubprocessExt;
 
 pub use super::shell_output_streaming::{
-    DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD, ShellOutputNotificationChunk,
-    ShellOutputNotificationParams, ShellOutputStream, parse_shell_output_notification,
+    parse_shell_output_notification, ShellOutputNotificationChunk, ShellOutputNotificationParams,
+    ShellOutputStream, DEVELOPER_SHELL_OUTPUT_NOTIFICATION_METHOD,
 };
-use super::shell_output_streaming::{SHELL_LIVE_OUTPUT_FLUSH_INTERVAL, ShellOutputBatcher};
+use super::shell_output_streaming::{ShellOutputBatcher, SHELL_LIVE_OUTPUT_FLUSH_INTERVAL};
 
 /// Check if the current process is running inside a Flatpak sandbox.
 ///

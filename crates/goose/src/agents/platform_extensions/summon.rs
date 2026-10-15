@@ -122,10 +122,7 @@ fn parse_agent_content(content: &str, path: &Path) -> Option<SourceEntry> {
         properties.insert("model".to_string(), serde_json::Value::String(model));
     }
     if let Some(provider) = metadata.provider {
-        properties.insert(
-            "provider".to_string(),
-            serde_json::Value::String(provider),
-        );
+        properties.insert("provider".to_string(), serde_json::Value::String(provider));
     }
 
     Some(SourceEntry {
@@ -1381,12 +1378,14 @@ impl SummonClient {
             let global_cfg = Config::global();
             let google_entry = crate::config::get_provider_entry(global_cfg, "google");
             let vertex_entry = crate::config::get_provider_entry(global_cfg, "gcp_vertex_ai");
-            let google_configured =
-                google_entry.as_ref().is_some_and(|e| e.configured && e.enabled);
-            let vertex_configured =
-                vertex_entry.as_ref().is_some_and(|e| e.configured && e.enabled)
-                    || crate::config::get_active_provider(global_cfg).as_deref()
-                        == Some("gcp_vertex_ai");
+            let google_configured = google_entry
+                .as_ref()
+                .is_some_and(|e| e.configured && e.enabled);
+            let vertex_configured = vertex_entry
+                .as_ref()
+                .is_some_and(|e| e.configured && e.enabled)
+                || crate::config::get_active_provider(global_cfg).as_deref()
+                    == Some("gcp_vertex_ai");
 
             if !google_configured && vertex_configured {
                 tracing::info!(
