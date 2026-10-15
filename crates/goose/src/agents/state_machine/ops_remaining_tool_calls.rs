@@ -10,8 +10,8 @@ use tracing_futures::Instrument;
 use crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
 use crate::agents::state_machine::effects::GooseEffect;
 use crate::agents::state_machine::ops_toolcalling::{
-    ToolDisposition, emit_extended_pre_hooks, emit_post_tool_use, pending_tool_requests,
-    request_was_advertised, run_pre_tool_hooks, tool_span,
+    emit_extended_pre_hooks, emit_post_tool_use, pending_tool_requests, request_was_advertised,
+    run_pre_tool_hooks, tool_span, ToolDisposition,
 };
 use crate::agents::state_machine::{
     applied, messages_since_kickoff, not_applicable, pending_tool_confirmations, yielded, Emitter,
@@ -21,7 +21,6 @@ use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKI
 use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
 use crate::conversation::Conversation;
-use crate::conversation::message::Message;
 use crate::hooks::HookManager;
 use crate::session::Session;
 
