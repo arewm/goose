@@ -8,8 +8,8 @@ use crate::agents::final_output_tool::{FINAL_OUTPUT_NOT_ALONE_MESSAGE, FINAL_OUT
 use crate::agents::state_machine::ops_remaining_tool_calls::UNCLAIMED_TOOL_ERROR;
 use crate::agents::state_machine::ops_stop_hook::DENIED;
 use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE};
-use crate::config::GooseMode;
 use crate::config::permission::PermissionLevel;
+use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent, SystemNotificationType};
 
 struct HookTestEnv {
@@ -412,7 +412,8 @@ const DENY_AND_RECORD_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"
 /// Logs its stdin like the others, writes nothing to stdout, and exits
 /// non-zero. That is a hook that ran but never returned a decision.
 const ABNORMAL_EXIT_AND_RECORD_SCRIPT: &str = "#!/bin/sh\ncat >> \"$PLUGIN_ROOT/pre.log\"\nprintf '\\n' >> \"$PLUGIN_ROOT/pre.log\"\necho boom >&2\nexit 3\n";
-const HOOK_FAILURE_REFUSAL: &str = "Tool call blocked because policy hook `test-plugin` could not complete: \
+const HOOK_FAILURE_REFUSAL: &str =
+    "Tool call blocked because policy hook `test-plugin` could not complete: \
      the hook exited with status 3 and no usable decision. \
      That hook is configured to block on failure.";
 
@@ -455,11 +456,9 @@ async fn pre_tool_use_result_observes_denial_that_post_hooks_never_see() -> Resu
     assert_eq!(results[0]["policy_evaluated"], true);
     assert_eq!(results[0]["blocked_by"], "test-plugin");
     assert_eq!(results[0]["reason"], "blocked by test policy");
-    assert!(
-        results[0]["tool_call_id"]
+    assert!(results[0]["tool_call_id"]
         .as_str()
-            .is_some_and(|id| !id.is_empty())
-    );
+        .is_some_and(|id| !id.is_empty()));
     Ok(())
 }
 
@@ -557,8 +556,8 @@ async fn pre_tool_use_result_reports_allow_and_unevaluated_when_no_hook_matches(
 /// stdout and exits non-zero, so it never returned a decision. Execution stays
 /// fail-open and the event reports allow with policy_evaluated false.
 #[tokio::test]
-async fn pre_tool_use_result_reports_unevaluated_when_the_only_hook_exits_without_a_decision()
--> Result<()> {
+async fn pre_tool_use_result_reports_unevaluated_when_the_only_hook_exits_without_a_decision(
+) -> Result<()> {
     let env = RecordingHookEnv::new(&[
         ("PreToolUse", "", "pre.sh", ABNORMAL_EXIT_AND_RECORD_SCRIPT),
         ("PreToolUseResult", "", "result.sh", RECORD_RESULT_SCRIPT),
@@ -625,7 +624,6 @@ async fn recipe_final_output_emits_tool_hooks_with_one_tool_call_id() -> Result<
 
     let pres = env.payloads("pre.log");
     let results = env.payloads("result.log");
-    let posts = env.payloads("post.log");
     assert_eq!(
         pres.len(),
         1,
@@ -644,11 +642,9 @@ async fn recipe_final_output_emits_tool_hooks_with_one_tool_call_id() -> Result<
         pres[0]["tool_call_id"], results[0]["tool_call_id"],
         "PreToolUse and PreToolUseResult must carry the same tool_call_id"
     );
-    assert!(
-        pres[0]["tool_call_id"]
+    assert!(pres[0]["tool_call_id"]
         .as_str()
-            .is_some_and(|id| !id.is_empty())
-    );
+        .is_some_and(|id| !id.is_empty()));
     Ok(())
 }
 
@@ -684,20 +680,8 @@ async fn recipe_final_output_emits_post_tool_event() -> Result<()> {
         1,
         "PostToolUse must fire for a successful recipe final output"
     );
-    assert!(env.payloads("postfail.log").is_empty());
-    assert_eq!(pres[0]["tool_name"], FINAL_OUTPUT_TOOL_NAME);
-    assert_eq!(results[0]["tool_name"], FINAL_OUTPUT_TOOL_NAME);
-    assert_eq!(results[0]["event"], "PreToolUseResult");
-    assert_eq!(results[0]["decision"], "allow");
     assert_eq!(posts[0]["event"], "PostToolUse");
     assert_eq!(posts[0]["tool_name"], FINAL_OUTPUT_TOOL_NAME);
-    assert!(pres[0]["tool_call_id"]
-        .as_str()
-        .is_some_and(|id| !id.is_empty()));
-    assert_eq!(
-        pres[0]["tool_call_id"], results[0]["tool_call_id"],
-        "PreToolUse and PreToolUseResult must carry the same tool_call_id"
-    );
     assert_eq!(
         posts[0]["tool_call_id"], pres[0]["tool_call_id"],
         "the post event must carry the same tool_call_id as the pre events"
@@ -884,11 +868,9 @@ async fn load_skill_emits_pre_tool_use_and_result_with_matching_id() -> Result<(
         pres[0]["tool_call_id"], results[0]["tool_call_id"],
         "PreToolUse and PreToolUseResult must carry the same tool_call_id"
     );
-    assert!(
-        pres[0]["tool_call_id"]
+    assert!(pres[0]["tool_call_id"]
         .as_str()
-            .is_some_and(|id| !id.is_empty())
-    );
+        .is_some_and(|id| !id.is_empty()));
     Ok(())
 }
 

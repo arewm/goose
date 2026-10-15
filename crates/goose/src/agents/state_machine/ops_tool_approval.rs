@@ -7,17 +7,17 @@ use async_trait::async_trait;
 
 use crate::agents::state_machine::ops_toolcalling::request_was_advertised;
 use crate::agents::state_machine::{
-    ConversationEffect, Emitter, GooseEffect, Operation, OperationResult, applied,
-    messages_since_kickoff, not_applicable,
+    applied, messages_since_kickoff, not_applicable, ConversationEffect, Emitter, GooseEffect,
+    Operation, OperationResult,
 };
-use crate::config::GooseMode;
 use crate::config::permission::PermissionLevel;
-use crate::conversation::Conversation;
+use crate::config::GooseMode;
 use crate::conversation::message::{ActionRequiredData, Message, MessageContent, ToolRequest};
+use crate::conversation::Conversation;
 use crate::permission::Permission;
 use crate::session::Session;
 use crate::tool_inspection::{
-    InspectionAction, ToolInspectionManager, get_security_finding_id_from_results,
+    get_security_finding_id_from_results, InspectionAction, ToolInspectionManager,
 };
 
 pub const TOOL_EXECUTABLE_KEY: &str = "goose.executable";

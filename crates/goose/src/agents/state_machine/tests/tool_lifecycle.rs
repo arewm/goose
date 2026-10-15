@@ -5,18 +5,18 @@ use rmcp::model::{CallToolRequestParams, ElicitationAction, ErrorData};
 use serde_json::json;
 
 use super::calculator_extension::{
-    ADD, ADD_WITH_AUDIENCE, APP_ONLY, DIVIDE, REQUEST_VALUE, delayed_value, value,
+    delayed_value, value, ADD, ADD_WITH_AUDIENCE, APP_ONLY, DIVIDE, REQUEST_VALUE,
 };
 use super::dummy_api::DummyApi;
+use super::pipeline::MessageKind::{Agent, Confirmation, ToolCall, ToolResponse};
 use super::pipeline::TestPipeline;
 use super::pipeline::MAX_TURNS;
-use super::pipeline::MessageKind::{Agent, Confirmation, ToolCall, ToolResponse};
 use super::test_pipeline;
 use crate::agents::state_machine::MAX_TURNS_MESSAGE;
 use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE};
 use crate::agents::AgentEvent;
-use crate::config::GooseMode;
 use crate::config::permission::PermissionLevel;
+use crate::config::GooseMode;
 use crate::conversation::message::{Message, MessageContent};
 use crate::permission::Permission;
 
