@@ -147,7 +147,29 @@ impl ModelConfig {
 
     pub fn with_canonical_limits(mut self, provider_name: &str) -> Self {
         let canonical = self.canonical_model(provider_name);
+        self.apply_canonical_model_info(canonical.as_ref());
+        self
+    }
 
+    /// Fill unset output limits, reasoning, and vision support from the
+    /// canonical entry of the model a declared alias resolves to. A configured
+    /// alias name (e.g. a per-effort variant of one hosted model) does not
+    /// itself appear in the canonical registry, but it inherits the limits of
+    /// the model it points at.
+    pub fn with_alias_canonical_limits(
+        mut self,
+        provider_name: &str,
+        resolved_model: &str,
+    ) -> Self {
+        let canonical = crate::canonical::maybe_get_canonical_model(provider_name, resolved_model);
+        self.apply_canonical_model_info(canonical.as_ref());
+        self
+    }
+
+    fn apply_canonical_model_info(
+        &mut self,
+        canonical: Option<&crate::canonical::CanonicalModel>,
+    ) {
         if let Some(canonical) = canonical {
             if self.max_tokens.is_none() {
                 self.max_tokens = canonical
@@ -168,8 +190,6 @@ impl ModelConfig {
                 )
             }
         }
-
-        self
     }
 
     pub fn with_context_limit(mut self, limit: Option<usize>) -> Self {
@@ -853,6 +873,34 @@ mod tests {
             let config = ModelConfig::new("gpt-4o").with_canonical_limits("openai");
             assert_eq!(config.max_tokens, Some(16_384));
             assert_eq!(config.reasoning, Some(false));
+        }
+
+        #[test]
+        fn alias_inherits_limits_of_resolved_model() {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_MAX_TOKENS", None::<&str>),
+                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ]);
+            // The alias name is not in the canonical registry; the resolved
+            // hosted model is.
+            let config = ModelConfig::new("glm-5-3-low")
+                .with_alias_canonical_limits("enmaas-anthropic", "rits/zai-org/glm-5-3");
+            assert_eq!(config.max_tokens, Some(131_072));
+            assert_eq!(config.reasoning, Some(true));
+        }
+
+        #[test]
+        fn alias_limits_do_not_override_existing_values() {
+            let _guard = env_lock::lock_env([
+                ("GOOSE_MAX_TOKENS", None::<&str>),
+                ("GOOSE_CONTEXT_LIMIT", None::<&str>),
+            ]);
+            let mut config = ModelConfig::new("glm-5-3-low");
+            config.max_tokens = Some(2_000);
+            let config =
+                config.with_alias_canonical_limits("enmaas-anthropic", "rits/zai-org/glm-5-3");
+
+            assert_eq!(config.max_tokens, Some(2_000));
         }
 
         #[test]

@@ -162,6 +162,13 @@ impl AnthropicProvider {
         tools: &[Tool],
         format_options: AnthropicFormatOptions,
     ) -> Result<Value, ProviderError> {
+        // A declared model may be an alias or endpoint whose underlying wire
+        // model differs from its configured name (e.g. per-effort aliases that
+        // all resolve to the same hosted model).
+        let wire_model = self
+            .declared_model(&model_config.model_name)
+            .and_then(|model| model.resolved_model.as_deref())
+            .unwrap_or(wire_model);
         let mut payload = create_request_for_model(
             &self.name,
             model_config,
@@ -170,8 +177,7 @@ impl AnthropicProvider {
             messages,
             tools,
             format_options,
-        )?;
-        payload["stream"] = Value::Bool(true);
+        )?;        payload["stream"] = Value::Bool(true);
         if let Some(params) = self
             .declared_model(&model_config.model_name)
             .and_then(|m| m.request_params.as_ref())
@@ -708,6 +714,39 @@ mod tests {
         assert_eq!(models[0].name, "unrecognized-static-model");
         assert_eq!(models[0].context_limit, Some(4096));
         assert!(models[0].reasoning);
+    }
+
+    #[test]
+    fn streaming_payload_resolves_declared_alias_wire_model() {
+        let mut provider = make_provider_with_custom_models("http://localhost", vec![]);
+        provider.custom_models = Some(vec![ModelInfo {
+            resolved_model: Some("rits/zai-org/glm-5-3".to_string()),
+            request_params: Some(HashMap::from([(
+                "reasoning_effort".to_string(),
+                json!("low"),
+            )])),
+            ..ModelInfo::new("glm-5-3-low")
+        }]);
+
+        let mut model = ModelConfig::new("glm-5-3-low");
+        model.max_tokens = Some(64_000);
+        let messages = vec![Message::user().with_text("Continue")];
+
+        let payload = provider
+            .streaming_payload(
+                &model,
+                "glm-5-3-low",
+                "system",
+                &messages,
+                &[],
+                AnthropicFormatOptions::default(),
+            )
+            .unwrap();
+
+        // The alias name must be resolved to the hosted wire model, while the
+        // alias's declared request params still apply.
+        assert_eq!(payload["model"], json!("rits/zai-org/glm-5-3"));
+        assert_eq!(payload["reasoning_effort"], json!("low"));
     }
 
     fn make_provider_with_custom_models(

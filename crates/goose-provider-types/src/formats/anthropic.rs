@@ -854,6 +854,41 @@ pub fn thinking_budget_tokens(model_config: &ModelConfig) -> i32 {
 // Shared with the Bedrock formatter, which applies the same clamp.
 pub const MIN_ANSWER_TOKENS: i32 = 1024;
 
+/// Z.AI's Anthropic-compatible API — and gateways fronting it, such as EnMaaS —
+/// accepts a top-level `reasoning_effort` parameter for GLM models, while the
+/// Claude `thinking` budget is accepted but not honored. When the requested
+/// model resolves to a Z.AI-family canonical entry, map the configured thinking
+/// effort onto one of the model's declared effort levels. Real Anthropic models
+/// keep the Claude thinking-block behavior, and declared per-model request
+/// params are merged after this and take precedence.
+fn zai_reasoning_effort_for_model(
+    provider_name: &str,
+    model_config: &ModelConfig,
+) -> Option<String> {
+    let effort = model_config.thinking_effort()?;
+    let catalog = maybe_get_canonical_model(provider_name, &model_config.model_name)?;
+    let org = catalog.id.split('/').next()?;
+    if !matches!(
+        org,
+        "zai" | "zhipuai" | "zai-coding-plan" | "zhipuai-coding-plan"
+    ) {
+        return None;
+    }
+    let catalog_efforts = catalog.reasoning_efforts.as_deref()?;
+
+    let preferred: &[&str] = match effort {
+        ThinkingEffort::Off => &["none", "minimal", "low"],
+        ThinkingEffort::Low => &["low", "minimal", "medium", "high", "max", "xhigh"],
+        ThinkingEffort::Medium => &["medium", "high", "low", "max", "xhigh"],
+        ThinkingEffort::High => &["high", "medium", "max", "xhigh", "low"],
+        ThinkingEffort::Max => &["max", "xhigh", "high", "medium", "low"],
+    };
+    preferred
+        .iter()
+        .find(|level| catalog_efforts.iter().any(|value| value == **level))
+        .map(|level| (*level).to_string())
+}
+
 fn apply_thinking_config(
     payload: &mut Value,
     provider_name: &str,
@@ -862,6 +897,12 @@ fn apply_thinking_config(
     options: AnthropicFormatOptions,
 ) {
     let obj = payload.as_object_mut().unwrap();
+    // GLM models behind Anthropic-compatible endpoints take a top-level
+    // `reasoning_effort` in addition to the Claude thinking params; gateways
+    // honor whichever mechanism they support.
+    if let Some(effort) = zai_reasoning_effort_for_model(provider_name, model_config) {
+        obj.insert("reasoning_effort".to_string(), json!(effort));
+    }
     match thinking_type_for_provider(provider_name, model_config) {
         ThinkingType::Adaptive => {
             obj.insert("thinking".to_string(), json!({"type": "adaptive"}));
@@ -1516,6 +1557,100 @@ mod tests {
             tools,
             options,
         )
+    }
+
+    #[test]
+    fn zai_models_emit_reasoning_effort_from_thinking_effort() {
+        let mut model = ModelConfig::new("rits/zai-org/glm-5-3");
+        model.max_tokens = Some(64_000);
+        model = model.with_thinking_effort(ThinkingEffort::Low);
+        let messages = vec![Message::user().with_text("hi")];
+
+        let payload = create_request(
+            "enmaas-anthropic",
+            &model,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
+    fn zai_reasoning_effort_maps_to_declared_levels() {
+        // GLM declares [low, high, max]: unsupported levels map to the closest
+        // supported one (medium up to high, off down to low).
+        let cases = [
+            (ThinkingEffort::Medium, "high"),
+            (ThinkingEffort::Off, "low"),
+            (ThinkingEffort::Max, "max"),
+        ];
+        for (effort, expected) in cases {
+            let mut model = ModelConfig::new("glm-5.3");
+            model.max_tokens = Some(64_000);
+            model = model.with_thinking_effort(effort);
+            let messages = vec![Message::user().with_text("hi")];
+
+            let payload = create_request(
+                "zai",
+                &model,
+                "system",
+                &messages,
+                &[],
+                AnthropicFormatOptions::default(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                payload["reasoning_effort"],
+                json!(expected),
+                "effort {:?}",
+                effort
+            );
+        }
+    }
+
+    #[test]
+    fn zai_models_without_configured_effort_emit_nothing() {
+        let mut model = ModelConfig::new("glm-5.3");
+        model.max_tokens = Some(64_000);
+        let messages = vec![Message::user().with_text("hi")];
+
+        let payload = create_request(
+            "zai",
+            &model,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions::default(),
+        )
+        .unwrap();
+
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn anthropic_models_do_not_emit_reasoning_effort() {
+        let mut model = ModelConfig::new("claude-sonnet-4.6");
+        model.max_tokens = Some(64_000);
+        model = model.with_thinking_effort(ThinkingEffort::Low);
+        let messages = vec![Message::user().with_text("hi")];
+
+        let payload = create_request(
+            ANTHROPIC_PROVIDER_NAME,
+            &model,
+            "system",
+            &messages,
+            &[],
+            AnthropicFormatOptions::default(),
+        )
+        .unwrap();
+
+        assert!(payload.get("reasoning_effort").is_none());
+        assert!(payload.get("thinking").is_some());
     }
 
     #[test]
