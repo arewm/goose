@@ -3077,6 +3077,7 @@ mod tests {
             reasoning: Some(false),
             supports_vision: Some(true),
             request_headers: None,
+            auto_compact_token_limit: None,
         };
 
         let switched =
