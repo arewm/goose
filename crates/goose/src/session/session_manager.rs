@@ -3189,6 +3189,7 @@ mod tests {
             request_params: None,
             reasoning: None,
             supports_vision: None,
+            auto_compact_token_limit: None,
             request_headers: None,
         })
         .unwrap();

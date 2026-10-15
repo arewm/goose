@@ -176,6 +176,7 @@ fn base_model_config_from_user_config(
         request_params: None,
         reasoning: None,
         supports_vision: None,
+        auto_compact_token_limit: None,
         request_headers: None,
     };
     if provider_name != oi_kit_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {

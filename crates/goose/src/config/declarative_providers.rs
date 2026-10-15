@@ -621,6 +621,7 @@ mod tests {
                 supports_cache_control: None,
                 reasoning: false,
                 supports_vision: None,
+                auto_compact_token_limit: None,
                 thinking_preservation_format: None,
                 request_params: None,
             }],
