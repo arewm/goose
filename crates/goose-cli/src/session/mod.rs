@@ -8,6 +8,7 @@ mod paste;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
+mod tty;
 
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
