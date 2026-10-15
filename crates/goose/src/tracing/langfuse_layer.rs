@@ -561,6 +561,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test-local manager, never contended
     async fn test_batch_manager_spawn_sender() {
         let fixture = TestFixture::new().await.with_mock_server().await;
 
