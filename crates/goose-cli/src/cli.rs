@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell as ClapShell};
 use clap_complete_nushell::Nushell as ClapNushell;
+use goose::agents::platform_extensions::summon::register_extra_working_dirs;
 use goose::agents::GoosePlatform;
 #[cfg(feature = "bundled-mcp")]
 use goose::builtin_extension::register_builtin_extensions;
@@ -138,6 +139,14 @@ pub struct SessionOptions {
         long_help = "Set a limit on how many turns (iterations) the agent can take without asking for user input to continue."
     )]
     pub max_turns: Option<u32>,
+
+    #[arg(
+        long = "add-dir",
+        value_name = "PATH",
+        help = "Additional working directory available to delegated subagents (repeatable)",
+        long_help = "Register an extra working directory that delegated subagents may run in, in addition to the session's working directory. Repeatable. Also settable via the GOOSE_EXTRA_WORKDIRS environment variable. Only honored when goose is launched interactively from a terminal; refused for nested or headless invocations to keep the delegate sandbox launch-scoped."
+    )]
+    pub add_dirs: Vec<std::path::PathBuf>,
 
     #[arg(
         long = "container",
@@ -2015,6 +2024,35 @@ async fn handle_session_subcommand(command: SessionCommand) -> Result<()> {
     Ok(())
 }
 
+/// Collect `--add-dir` flags plus the `GOOSE_EXTRA_WORKDIRS` environment
+/// variable and register them as delegate-accessible roots.
+///
+/// Widening the delegate sandbox is reserved for interactive, human-launched
+/// sessions: if any extra directory is requested but stdin or stdout is not a
+/// terminal (as is the case for headless `goose run` and for any goose spawned
+/// by another goose's shell tool, whose stdio is piped), refuse instead of
+/// registering. This is hardening, not a security boundary: a determined
+/// nested process can fake a tty.
+fn register_additional_working_dirs(session_opts: &SessionOptions) -> Result<()> {
+    let mut dirs: Vec<std::path::PathBuf> = session_opts.add_dirs.clone();
+    if let Ok(extra) = std::env::var("GOOSE_EXTRA_WORKDIRS") {
+        dirs.extend(std::env::split_paths(&extra));
+    }
+    dirs.retain(|dir| !dir.as_os_str().is_empty());
+    if dirs.is_empty() {
+        return Ok(());
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "--add-dir / GOOSE_EXTRA_WORKDIRS is only supported for interactive terminal \
+             sessions; refusing to register additional working directories without a tty \
+             (this can happen when goose is launched headless or by another goose process)"
+        );
+    }
+    register_extra_working_dirs(dirs)
+}
+
 struct InteractiveSessionArgs {
     identifier: Option<Identifier>,
     resume: bool,
@@ -2043,6 +2081,8 @@ async fn handle_interactive_session(args: InteractiveSessionArgs) -> Result<()> 
     if get_telemetry_choice().is_none() {
         configure_telemetry_consent_dialog()?;
     }
+
+    register_additional_working_dirs(&session_opts)?;
 
     let session_start = std::time::Instant::now();
     let session_type = if fork {
@@ -2290,6 +2330,8 @@ async fn handle_run_command(
     if run_behavior.interactive && get_telemetry_choice().is_none() {
         configure_telemetry_consent_dialog()?;
     }
+
+    register_additional_working_dirs(&session_opts)?;
 
     let parsed = parse_run_input(&input_opts, output_opts.quiet)?;
 
