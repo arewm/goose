@@ -33,6 +33,11 @@ pub enum InputResult {
     Edit(Option<String>),
     ListSkills,
     LoadSkills(Vec<String>),
+    QueueEdit,
+    QueueList,
+    QueueResume,
+    /// Any other `/queue ...` line, carried verbatim for interpretation.
+    QueueSubcommand(String),
 }
 
 #[derive(Debug)]
@@ -118,6 +123,7 @@ fn should_use_editor_always(
 pub fn get_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     conversation_messages: Option<&Vec<String>>,
+    initial: Option<&str>,
 ) -> Result<InputResult> {
     // Reading the prompt controls the terminal (raw mode); doing that from a
     // background process group stops us with SIGTTOU. Wait for the
@@ -136,7 +142,7 @@ pub fn get_input(
                 let messages = extract_recent_messages(conversation_messages);
                 let message_refs: Vec<&str> = messages.iter().map(|s| s.as_str()).collect();
                 let (message, has_meaningful_content) =
-                    crate::session::editor::get_editor_input(&editor_cmd, &message_refs, None)?;
+                    crate::session::editor::get_editor_input(&editor_cmd, &message_refs, initial)?;
 
                 if has_meaningful_content {
                     editor.add_history_entry(message.as_str())?;
@@ -188,7 +194,7 @@ pub fn get_input(
         rustyline::EventHandler::Conditional(Box::new(CtrlCHandler::new(completion_cache))),
     );
 
-    let input = match read_paste_aware_input(editor, paste_state) {
+    let input = match read_paste_aware_input(editor, paste_state, initial) {
         Ok(text) => text,
         Err(e) => match e {
             rustyline::error::ReadlineError::Interrupted => return Ok(InputResult::Exit),
@@ -225,7 +231,7 @@ pub fn get_input(
     }
 }
 
-fn handle_slash_command(input: &str) -> Option<InputResult> {
+pub(crate) fn handle_slash_command(input: &str) -> Option<InputResult> {
     let input = input.trim();
 
     // Command prefix constants
@@ -249,6 +255,10 @@ fn handle_slash_command(input: &str) -> Option<InputResult> {
 
     match input {
         "/exit" | "/quit" => Some(InputResult::Exit),
+        "/queue" | "/queue list" => Some(InputResult::QueueList),
+        "/queue edit" => Some(InputResult::QueueEdit),
+        "/queue resume" => Some(InputResult::QueueResume),
+        s if s.starts_with("/queue ") => Some(InputResult::QueueSubcommand(s.to_string())),
         "/?" | "/help" => {
             print_help();
             print_editor_help();
@@ -466,6 +476,10 @@ fn help_text() -> String {
 /edit [text] - Open your prompt editor to compose a message. Optionally pre-fill with text.
                Uses $GOOSE_PROMPT_EDITOR, $VISUAL, or $EDITOR (in that order).
 /skills - List available skills or enable skills by name (usage: /skills [<name>...])
+/queue - List queued next-step messages
+/queue edit - Reorder, edit, or delete queued messages in your editor (rebase-style)
+/queue resume - Continue auto-sending a held queue
+/queue <n> - Recall queued message n for editing (mid-turn)
 /? or /help - Display this help message
 /clear - Clears the current chat history
 /new - Start a fresh session in this process, keeping the current provider, model and extensions
@@ -475,7 +489,22 @@ Enter - Send message
 Ctrl+{newline_key} - Add a newline (configurable via GOOSE_CLI_NEWLINE_KEY)
 Ctrl+C - Clear current line if text is entered, otherwise exit the session
 Up/Down arrows - Navigate through command history
-GOOSE_CLI_BELL=true - Ring the terminal bell when goose finishes a turn or needs approval"
+GOOSE_CLI_BELL=true - Ring the terminal bell when goose finishes a turn or needs approval
+
+Message queue:
+While a turn runs, typed lines are queued as next steps and auto-sent
+one per turn (in order) after it completes, behind a short hold window.
+Enter - Queue the typed line (or, while browsing, update that message)
+Up/Down arrows - Browse the queue like shell history (non-destructive);
+        arrows and backspace edit within the line, Enter saves in place,
+        walking down past the end returns to a fresh line
+Ctrl+U - Drop the browsed message, or clear the line being typed
+Esc - Discard the line; then leave browsing unchanged; then interrupt
+/queue, /queue edit, /queue list, /queue <n>, /queue drop <n> also work
+mid-turn and are served at the turn boundary; any key during the hold
+window pauses the queue.
+Note: keystrokes sent just as an approval prompt appears may be captured
+as type-ahead for a moment before the prompt takes over."
     )
 }
 
