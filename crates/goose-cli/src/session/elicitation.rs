@@ -44,6 +44,10 @@ pub fn collect_elicitation_input(
             "elicitation requires an interactive terminal",
         ));
     }
+    // The mid-turn type-ahead reader must not steal these keystrokes:
+    // mark stdin as yielded for the duration of the prompt so the
+    // reader parks with the terminal restored.
+    let _stdin_yielded = crate::session::queue::StdinYield::acquire();
     // Prompting controls the terminal (raw mode); from a background process
     // group that stops us with SIGTTOU. Wait for the foreground first —
     // covering the select, confirm, and free-text paths alike — and bail
