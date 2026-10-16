@@ -436,7 +436,43 @@ fn configure_shell_termination_scope(
     scope: ShellTerminationScope,
 ) {
     if matches!(scope, ShellTerminationScope::ProcessGroup) {
-        command.process_group(0);
+        if shell_detached_session_enabled() {
+            // A new session implies a fresh process group led by the child,
+            // so group-signalled cancellation (kill(-pid)) keeps working.
+            // Unlike a bare process group, the child also loses its
+            // controlling terminal: /dev/tty becomes unopenable, so
+            // descendants cannot read credentials or steal the terminal's
+            // foreground process group from the interactive session.
+            // SAFETY: between fork and exec the closure only calls
+            // setsid(2), which is async-signal-safe; the child is not a
+            // process-group leader at that point, so the call succeeds.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        } else {
+            command.process_group(0);
+        }
+    }
+}
+
+/// Whether shell-tool children are spawned in their own session (default) or
+/// merely their own process group. Set `GOOSE_SHELL_SETSID=0` to fall back to
+/// the process-group-only behavior, e.g. for workflows that relied on a child
+/// prompting on the real terminal via /dev/tty.
+#[cfg(unix)]
+fn shell_detached_session_enabled() -> bool {
+    match std::env::var("GOOSE_SHELL_SETSID") {
+        Ok(value) => {
+            let value = value.trim();
+            value.is_empty() || value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Err(_) => true,
     }
 }
 
@@ -1103,6 +1139,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn shell_cancellation_kills_descendants() {
         if is_flatpak() {
             return;
@@ -1139,12 +1176,105 @@ mod tests {
             unsafe { libc::getpgrp() },
             "the shell process group must not be Goose's process group"
         );
+        assert_eq!(
+            unsafe { libc::getsid(shell_pid) },
+            shell_pid,
+            "the spawned shell must lead its own session (setsid)"
+        );
+        assert_ne!(
+            unsafe { libc::getsid(shell_pid) },
+            unsafe { libc::getsid(0) },
+            "the shell session must not be Goose's session"
+        );
 
         token.cancel();
         let result = assert_task_completes(task).await;
 
         assert!(extract_shell_output(&result).exit_code.is_none());
         assert_pid_exits(descendant_pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shell_setsid_env_gate_falls_back_to_process_group() {
+        if is_flatpak() {
+            return;
+        }
+
+        std::env::set_var("GOOSE_SHELL_SETSID", "0");
+        // Clean up the env var and cancel the shell even if an assertion
+        // panics, so the mutation cannot leak into other tests.
+        struct Cleanup {
+            token: CancellationToken,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::env::remove_var("GOOSE_SHELL_SETSID");
+                self.token.cancel();
+            }
+        }
+        let token = CancellationToken::new();
+        let _cleanup = Cleanup {
+            token: token.clone(),
+        };
+
+        let pid_file = tempfile::NamedTempFile::new().unwrap();
+        let tool = ShellTool::new().unwrap();
+        let command = descendant_command(pid_file.path());
+        let task = tokio::spawn({
+            let token = token.clone();
+            async move {
+                tool.shell_with_cwd(
+                    ShellParams {
+                        command,
+                        timeout_secs: None,
+                    },
+                    None,
+                    None,
+                    token,
+                )
+                .await
+            }
+        });
+
+        let (shell_pid, descendant_pid) = wait_for_pids(pid_file.path()).await;
+        assert_eq!(
+            unsafe { libc::getsid(shell_pid) },
+            unsafe { libc::getsid(0) },
+            "gate off: the shell must share Goose's session"
+        );
+        assert_eq!(
+            unsafe { libc::getpgid(shell_pid) },
+            shell_pid,
+            "gate off: the shell must still lead its own process group"
+        );
+
+        token.cancel();
+        let result = assert_task_completes(task).await;
+        assert!(extract_shell_output(&result).exit_code.is_none());
+        assert_pid_exits(descendant_pid).await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn shell_setsid_env_gate_parses_values() {
+        std::env::remove_var("GOOSE_SHELL_SETSID");
+        assert!(shell_detached_session_enabled(), "default must be on");
+
+        for off in ["0", "false", "FALSE"] {
+            std::env::set_var("GOOSE_SHELL_SETSID", off);
+            assert!(
+                !shell_detached_session_enabled(),
+                "{off} must disable setsid"
+            );
+        }
+        for on in ["1", "true", ""] {
+            std::env::set_var("GOOSE_SHELL_SETSID", on);
+            assert!(shell_detached_session_enabled(), "{on:?} must keep setsid");
+        }
+        std::env::remove_var("GOOSE_SHELL_SETSID");
     }
 
     #[cfg(not(windows))]
