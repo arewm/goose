@@ -149,7 +149,7 @@ pub fn wait_for_foreground(_cancel_token: Option<&tokio_util::sync::Cancellation
 /// foreground. Pure so it can be unit tested.
 #[cfg(all(test, unix))]
 fn in_foreground(foreground: Option<libc::pid_t>, own: libc::pid_t) -> bool {
-    foreground.map_or(true, |fg| fg == own)
+    foreground.is_none_or(|fg| fg == own)
 }
 
 #[cfg(all(test, unix))]
