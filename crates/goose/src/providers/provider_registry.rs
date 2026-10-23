@@ -94,8 +94,9 @@ impl ProviderEntry {
         // A declared alias inherits the canonical limits (output tokens,
         // reasoning, vision) of the model it resolves to; the alias name
         // itself is not in the canonical registry.
-        if let Some(resolved_model) = find_declared_model(&self.metadata.known_models, &model.model_name)
-            .and_then(|declared| declared.resolved_model.clone())
+        if let Some(resolved_model) =
+            find_declared_model(&self.metadata.known_models, &model.model_name)
+                .and_then(|declared| declared.resolved_model.clone())
         {
             model = model.with_alias_canonical_limits(&self.metadata.name, &resolved_model);
         }

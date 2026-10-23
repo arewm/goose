@@ -268,7 +268,9 @@ pub fn map_http_error(
 
                 if let Some(msg) = base_msg {
                     if let Some(details) = err_obj.get("details").or_else(|| p.get("details")) {
-                        if !details.is_null() && (!details.is_array() || !details.as_array().unwrap().is_empty()) {
+                        if !details.is_null()
+                            && (!details.is_array() || !details.as_array().unwrap().is_empty())
+                        {
                             return Some(format!("{msg} Details: {details}"));
                         }
                     }

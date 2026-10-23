@@ -121,144 +121,145 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
 
                         let mut function_call_part = Map::new();
                         function_call_part.insert("id".to_string(), json!(request.id));
-                        function_call_part.insert(
-                            "name".to_string(),
-                            json!(fn_name),
+                        function_call_part.insert("name".to_string(), json!(fn_name));
+
+                        if let Some(args) = &tool_call.arguments {
+                            if !args.is_empty() {
+                                function_call_part.insert("args".to_string(), args.clone().into());
+                            }
+                        }
+
+                        let mut part = Map::new();
+                        part.insert("functionCall".to_string(), json!(function_call_part));
+
+                        if let Some(signature) = get_thought_signature(&request.metadata) {
+                            insert_thought_signature(&mut part, signature);
+                        } else {
+                            insert_thought_signature(&mut part, SYNTHETIC_THOUGHT_SIGNATURE);
+                        }
+
+                        parts.push(json!(part));
+                    }
+                    Err(e) => {
+                        parts.push(json!({"text":format!("Error: {}", e)}));
+                    }
+                },
+                MessageContentBlock::ToolResponse(response) => match &response.tool_result {
+                    Ok(result) => {
+                        let mut tool_content = Vec::new();
+                        let mut media = Vec::new();
+                        for content in result.content.iter().cloned() {
+                            let inline = match &content {
+                                ContentBlock::Image(image) => {
+                                    Some((image.mime_type.clone(), image.data.clone()))
+                                }
+                                ContentBlock::Resource(embedded) => match &embedded.resource {
+                                    ResourceContents::BlobResourceContents {
+                                        blob,
+                                        mime_type,
+                                        ..
+                                    } => mime_type
+                                        .clone()
+                                        .filter(|m| !m.is_empty())
+                                        .map(|mime| (mime, blob.clone())),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            match inline {
+                                Some((mime, data)) if nested_function_response_media => {
+                                    media.push(json!({
+                                        "inlineData": {"mimeType": mime, "data": data}
+                                    }));
+                                }
+                                Some((mime, data)) => {
+                                    parts.push(json!({
+                                        "inline_data": {"mime_type": mime, "data": data}
+                                    }));
+                                }
+                                None => tool_content.push(content),
+                            }
+                        }
+                        let mut text = tool_content
+                            .iter()
+                            .filter_map(|c| match c {
+                                ContentBlock::Text(t) => Some(t.text.clone()),
+                                ContentBlock::Resource(raw_embedded_resource) => Some(
+                                    extract_text_from_resource(&raw_embedded_resource.resource),
+                                ),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        if text.is_empty() {
+                            text = "Tool call is done.".to_string();
+                        }
+                        let name = tool_names
+                            .get(response.id.as_str())
+                            .map(String::as_str)
+                            .or_else(|| {
+                                fallback_tool_names
+                                    .get(response.id.as_str())
+                                    .map(String::as_str)
+                            })
+                            .unwrap_or(response.id.as_str());
+                        let mut part =
+                            build_function_response_part(&response.id, name, text, media);
+                        maybe_insert_signature_from_metadata(&mut part, &response.metadata);
+                        parts.push(json!(part));
+                    }
+                    Err(e) => {
+                        let name = tool_names
+                            .get(response.id.as_str())
+                            .map(String::as_str)
+                            .or_else(|| {
+                                fallback_tool_names
+                                    .get(response.id.as_str())
+                                    .map(String::as_str)
+                            })
+                            .unwrap_or(response.id.as_str());
+                        let mut part = build_function_response_part(
+                            &response.id,
+                            name,
+                            format!("Error: {}", e),
+                            Vec::new(),
                         );
-
-                            if let Some(args) = &tool_call.arguments {
-                                if !args.is_empty() {
-                                    function_call_part
-                                        .insert("args".to_string(), args.clone().into());
-                                }
-                            }
-
-                            let mut part = Map::new();
-                            part.insert("functionCall".to_string(), json!(function_call_part));
-
-                            if let Some(signature) = get_thought_signature(&request.metadata) {
-                                insert_thought_signature(&mut part, signature);
-                            } else {
-                                insert_thought_signature(
-                                    &mut part,
-                                    SYNTHETIC_THOUGHT_SIGNATURE,
-                                );
-                            }
-
-                            parts.push(json!(part));
+                        maybe_insert_signature_from_metadata(&mut part, &response.metadata);
+                        parts.push(json!(part));
+                    }
+                },
+                MessageContentBlock::Thinking(_) => {}
+                MessageContentBlock::Image(image) => {
+                    parts.push(json!({
+                        "inline_data": {
+                            "mime_type": image.mime_type,
+                            "data": image.data,
                         }
-                        Err(e) => {
-                            parts.push(json!({"text":format!("Error: {}", e)}));
-                        }
-                    },
-                    MessageContentBlock::ToolResponse(response) => match &response.tool_result {
-                        Ok(result) => {
-                            let mut tool_content = Vec::new();
-                            let mut media = Vec::new();
-                            for content in result.content.iter().cloned() {
-                                let inline = match &content {
-                                    ContentBlock::Image(image) => {
-                                        Some((image.mime_type.clone(), image.data.clone()))
-                                    }
-                                    ContentBlock::Resource(embedded) => match &embedded.resource {
-                                        ResourceContents::BlobResourceContents {
-                                            blob,
-                                            mime_type,
-                                            ..
-                                        } => mime_type
-                                            .clone()
-                                            .filter(|m| !m.is_empty())
-                                            .map(|mime| (mime, blob.clone())),
-                                        _ => None,
-                                    },
-                                    _ => None,
-                                };
-                                match inline {
-                                    Some((mime, data)) if nested_function_response_media => {
-                                        media.push(json!({
-                                            "inlineData": {"mimeType": mime, "data": data}
-                                        }));
-                                    }
-                                    Some((mime, data)) => {
-                                        parts.push(json!({
-                                            "inline_data": {"mime_type": mime, "data": data}
-                                        }));
-                                    }
-                                    None => tool_content.push(content),
-                                }
-                            }
-                            let mut text = tool_content
-                                .iter()
-                                .filter_map(|c| match c {
-                                    ContentBlock::Text(t) => Some(t.text.clone()),
-                                    ContentBlock::Resource(raw_embedded_resource) => Some(
-                                        extract_text_from_resource(&raw_embedded_resource.resource),
-                                    ),
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-
-                            if text.is_empty() {
-                                text = "Tool call is done.".to_string();
-                            }
-                            let name = tool_names
-                                .get(response.id.as_str())
-                                .map(String::as_str)
-                                .or_else(|| fallback_tool_names.get(response.id.as_str()).map(String::as_str))
-                                .unwrap_or(response.id.as_str());
-                            let mut part =
-                                build_function_response_part(&response.id, name, text, media);
-                            maybe_insert_signature_from_metadata(&mut part, &response.metadata);
-                            parts.push(json!(part));
-                        }
-                        Err(e) => {
-                            let name = tool_names
-                                .get(response.id.as_str())
-                                .map(String::as_str)
-                                .or_else(|| fallback_tool_names.get(response.id.as_str()).map(String::as_str))
-                                .unwrap_or(response.id.as_str());
-                            let mut part = build_function_response_part(
-                                &response.id,
-                                name,
-                                format!("Error: {}", e),
-                                Vec::new(),
-                            );
-                            maybe_insert_signature_from_metadata(&mut part, &response.metadata);
-                            parts.push(json!(part));
-                        }
-                    },
-                    MessageContentBlock::Thinking(_) => {}
-                    MessageContentBlock::Image(image) => {
+                    }));
+                }
+                MessageContentBlock::Document(document) => {
+                    if document_media_type_is_supported(&document.mime_type) {
                         parts.push(json!({
                             "inline_data": {
-                                "mime_type": image.mime_type,
-                                "data": image.data,
+                                "mime_type": document.mime_type,
+                                "data": document.data,
                             }
                         }));
-                    }
-                    MessageContentBlock::Document(document) => {
-                        if document_media_type_is_supported(&document.mime_type) {
-                            parts.push(json!({
-                                "inline_data": {
-                                    "mime_type": document.mime_type,
-                                    "data": document.data,
-                                }
-                            }));
-                        } else {
-                            parts.push(json!({
+                    } else {
+                        parts.push(json!({
                                 "text": unsupported_document_text(document, UNSUPPORTED_MEDIA_TYPE_REASON)
                             }));
-                        }
                     }
-
-                    _ => {}
                 }
-            }
-            if !parts.is_empty() {
-                raw_contents.push(json!({"role": role, "parts": parts}));
+
+                _ => {}
             }
         }
+        if !parts.is_empty() {
+            raw_contents.push(json!({"role": role, "parts": parts}));
+        }
+    }
 
     let mut coalesced: Vec<Value> = Vec::new();
     for mut item in raw_contents {
@@ -283,10 +284,14 @@ pub fn format_messages(messages: &[Message], nested_function_response_media: boo
                     let last_has_fn_response = last
                         .get("parts")
                         .and_then(|p| p.as_array())
-                        .map(|arr| arr.iter().any(|part| part.get("functionResponse").is_some()))
+                        .map(|arr| {
+                            arr.iter()
+                                .any(|part| part.get("functionResponse").is_some())
+                        })
                         .unwrap_or(false);
-                    let item_has_fn_response =
-                        parts.iter().any(|part| part.get("functionResponse").is_some());
+                    let item_has_fn_response = parts
+                        .iter()
+                        .any(|part| part.get("functionResponse").is_some());
 
                     if last_has_fn_response != item_has_fn_response {
                         // Google Gemini forbids mixing `functionResponse` and regular text
@@ -2138,7 +2143,9 @@ data: [DONE]"#;
         let message = response_to_message(response).unwrap();
         assert_eq!(message.role, Role::Assistant);
         assert_eq!(message.content.len(), 1);
-        let tool_req = message.content[0].as_tool_request().expect("Expected tool request");
+        let tool_req = message.content[0]
+            .as_tool_request()
+            .expect("Expected tool request");
         match &tool_req.tool_call {
             Err(err) => {
                 assert_eq!(err.code, ErrorCode::INVALID_REQUEST);
@@ -2208,7 +2215,10 @@ data: [DONE]"#;
                 }
             }
         }
-        assert!(emitted_tool_request, "Expected synthetic tool request on MALFORMED_FUNCTION_CALL");
+        assert!(
+            emitted_tool_request,
+            "Expected synthetic tool request on MALFORMED_FUNCTION_CALL"
+        );
     }
 
     #[tokio::test]
@@ -2235,7 +2245,10 @@ data: [DONE]"#;
                 }
             }
         }
-        assert!(token_limit_reached, "Expected output_token_limit_reached metadata flag on MAX_TOKENS");
+        assert!(
+            token_limit_reached,
+            "Expected output_token_limit_reached metadata flag on MAX_TOKENS"
+        );
     }
 
     #[tokio::test]
@@ -2251,14 +2264,19 @@ data: [DONE]"#;
         let mut received_refusal = false;
         while let Some(result) = message_stream.next().await {
             if let Err(err) = result {
-                if let Some(ProviderError::Refusal { details, category }) = err.downcast_ref::<ProviderError>() {
+                if let Some(ProviderError::Refusal { details, category }) =
+                    err.downcast_ref::<ProviderError>()
+                {
                     assert!(details.contains("SAFETY"));
                     assert_eq!(category.as_deref(), Some("SAFETY"));
                     received_refusal = true;
                 }
             }
         }
-        assert!(received_refusal, "Expected Refusal error on SAFETY finishReason");
+        assert!(
+            received_refusal,
+            "Expected Refusal error on SAFETY finishReason"
+        );
     }
 
     #[test]
@@ -2308,16 +2326,14 @@ data: [DONE]"#;
         // Turn 1 assistant tool call at index 1 must preserve SIG1
         assert_eq!(payload[1]["role"], "model");
         assert_eq!(
-            payload[1]["parts"][0]["thoughtSignature"],
-            SIG1,
+            payload[1]["parts"][0]["thoughtSignature"], SIG1,
             "Historical function call must preserve its thought signature"
         );
 
         // Turn 2 assistant tool call at index 3 must still have SIG2
         assert_eq!(payload[3]["role"], "model");
         assert_eq!(
-            payload[3]["parts"][0]["thoughtSignature"],
-            SIG2,
+            payload[3]["parts"][0]["thoughtSignature"], SIG2,
             "Recent function call must preserve its thought signature"
         );
     }
@@ -2374,7 +2390,10 @@ data: [DONE]"#;
         assert_eq!(payload[4]["role"], "user");
         assert_eq!(payload[4]["parts"].as_array().unwrap().len(), 2);
         assert_eq!(payload[4]["parts"][0]["text"], "continue");
-        assert_eq!(payload[4]["parts"][1]["text"], "<turn-context>...</turn-context>");
+        assert_eq!(
+            payload[4]["parts"][1]["text"],
+            "<turn-context>...</turn-context>"
+        );
 
         // Verify strict alternation
         for i in 0..payload.len() - 1 {
@@ -2440,10 +2459,16 @@ data: [DONE]"#;
 
         // Model turn 2
         assert_eq!(payload[3]["role"], "model");
-        assert_eq!(payload[3]["parts"][0]["functionCall"]["name"], "todo__todo_write");
+        assert_eq!(
+            payload[3]["parts"][0]["functionCall"]["name"],
+            "todo__todo_write"
+        );
 
         // User turn 2 (functionResponse) MUST match "todo__todo_write"
         assert_eq!(payload[4]["role"], "user");
-        assert_eq!(payload[4]["parts"][0]["functionResponse"]["name"], "todo__todo_write");
+        assert_eq!(
+            payload[4]["parts"][0]["functionResponse"]["name"],
+            "todo__todo_write"
+        );
     }
 }
