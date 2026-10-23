@@ -173,12 +173,13 @@ impl ThinkingIndicator {
             .unwrap_or(true)
         {
             spinner.start(format!(
-                "{}...  {}",
+                "{}...  {}{}",
                 super::thinking::get_random_thinking_message(),
                 hint,
+                queue_badge()
             ));
         } else {
-            spinner.start(format!("Thinking...  {}", hint));
+            spinner.start(format!("Thinking...  {}{}", hint, queue_badge()));
         }
         self.spinner = Some(spinner);
     }
@@ -200,6 +201,39 @@ pub struct PromptInfo {
     pub description: Option<String>,
     pub arguments: Option<Vec<PromptArgument>>,
     pub extension: Option<String>,
+}
+
+// The session's queue, for live queue-state badges on progress output.
+// A process-wide static (not thread-local) because spinner updates can
+// fire from any async worker thread.
+static BADGE_QUEUE: std::sync::Mutex<Option<super::queue::SharedQueue>> =
+    std::sync::Mutex::new(None);
+
+/// Register the session queue so progress output can show queue state.
+pub fn set_queue(queue: super::queue::SharedQueue) {
+    *BADGE_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(queue);
+}
+
+/// A dim badge showing queued-message count and hold state, or an empty
+/// string when nothing is queued (or no queue is registered).
+fn queue_badge() -> String {
+    let guard = BADGE_QUEUE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(queue) = guard.as_ref() else {
+        return String::new();
+    };
+    let count = queue.len();
+    if count == 0 {
+        return String::new();
+    }
+    if queue.is_held() {
+        format!("  {}", style(format!("+{count} queued · held")).yellow())
+    } else {
+        format!("  {}", style(format!("+{count} queued")).dim())
+    }
 }
 
 // Global thinking indicator
@@ -1600,7 +1634,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
     }
 
     println!(
-        "  {} {} {}",
+        "  {} {} {}{}",
         colored_bar,
         style(format!("{}%", percentage)).dim(),
         style(format!(
@@ -1609,6 +1643,7 @@ pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
             format_tokens(context_limit)
         ))
         .dim(),
+        queue_badge(),
     );
 }
 
@@ -1669,13 +1704,13 @@ impl McpSpinners {
                             .unwrap()
                             .tick_chars("⠋⠙⠚⠛⠓⠒⠊⠉"),
                     )
-                    .with_message(message.to_string()),
+                    .with_message(format!("{message}{}", queue_badge())),
             );
             bar.enable_steady_tick(Duration::from_millis(100));
             bar
         });
 
-        spinner.set_message(message.to_string());
+        spinner.set_message(format!("{message}{}", queue_badge()));
     }
 
     pub fn log_shell_output(&mut self, lines: Vec<String>, max_lines: usize) {
@@ -1700,7 +1735,7 @@ impl McpSpinners {
         });
         bar.set_position((value * 100_f64) as u64);
         if let Some(msg) = message {
-            bar.set_message(msg.to_string());
+            bar.set_message(format!("{msg}{}", queue_badge()));
         }
     }
 
@@ -1749,6 +1784,24 @@ mod tests {
         }
 
         assert_eq!(rendered, "two\n  three\n  four");
+    }
+
+    #[test]
+    fn queue_badge_reflects_count_and_hold_state() {
+        let queue = super::super::queue::SharedQueue::detached();
+        set_queue(queue.clone());
+        // Empty queue: no badge at all.
+        assert_eq!(queue_badge(), "");
+        queue.enqueue("one".into());
+        queue.enqueue("two".into());
+        let badge = strip_str(&queue_badge()).to_string();
+        assert!(badge.contains("+2 queued"), "got: {badge}");
+        assert!(!badge.contains("held"), "got: {badge}");
+        queue.hold();
+        let badge = strip_str(&queue_badge()).to_string();
+        assert!(badge.contains("+2 queued · held"), "got: {badge}");
+        // Leave the global empty for other tests.
+        set_queue(super::super::queue::SharedQueue::detached());
     }
 
     #[test]

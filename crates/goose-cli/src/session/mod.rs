@@ -326,10 +326,13 @@ impl CliSession {
             }))
         });
 
+        let queue = queue::SharedQueue::load(&session_id);
+        output::set_queue(queue.clone());
+
         CliSession {
             agent,
             messages,
-            queue: queue::SharedQueue::load(&session_id),
+            queue,
             session_id,
             completion_cache,
             debug,
