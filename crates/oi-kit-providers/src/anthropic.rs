@@ -177,7 +177,8 @@ impl AnthropicProvider {
             messages,
             tools,
             format_options,
-        )?;        payload["stream"] = Value::Bool(true);
+        )?;
+        payload["stream"] = Value::Bool(true);
         if let Some(params) = self
             .declared_model(&model_config.model_name)
             .and_then(|m| m.request_params.as_ref())
