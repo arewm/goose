@@ -240,7 +240,11 @@ mod tests {
     async fn spawn_places_shell_in_its_own_session() {
         let mut process = ShellProcess::spawn(&mut sleep_command()).expect("spawn sleep");
         let pid = process.child.id().expect("live child") as libc::pid_t;
-        assert_eq!(unsafe { libc::getsid(pid) }, pid, "shell must lead its own session");
+        assert_eq!(
+            unsafe { libc::getsid(pid) },
+            pid,
+            "shell must lead its own session"
+        );
         assert_ne!(
             unsafe { libc::getsid(0) },
             pid,
@@ -280,7 +284,10 @@ mod tests {
     #[serial_test::serial]
     fn env_gate_parses_values() {
         std::env::remove_var("GOOSE_SHELL_SETSID");
-        assert!(platform::shell_detached_session_enabled(), "default must be on");
+        assert!(
+            platform::shell_detached_session_enabled(),
+            "default must be on"
+        );
 
         for off in ["0", "false", "FALSE"] {
             std::env::set_var("GOOSE_SHELL_SETSID", off);

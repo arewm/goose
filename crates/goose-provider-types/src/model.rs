@@ -174,10 +174,7 @@ impl ModelConfig {
         self
     }
 
-    fn apply_canonical_model_info(
-        &mut self,
-        canonical: Option<&crate::canonical::CanonicalModel>,
-    ) {
+    fn apply_canonical_model_info(&mut self, canonical: Option<&crate::canonical::CanonicalModel>) {
         if let Some(canonical) = canonical {
             if self.max_tokens.is_none() {
                 self.max_tokens = canonical
