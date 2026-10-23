@@ -12,6 +12,11 @@
 //! handed off as the next prompt's draft (persisted alongside the
 //! queue) instead of being discarded.
 //!
+//! While the user types, animated progress output is muted (see
+//! [`crate::session::output`]): the reader owns the terminal's input
+//! row, and releases it after a short typing idle so the spinner can
+//! resume from a clean line.
+//!
 //! Queue state is persisted as session metadata in a sidecar file so it
 //! survives compaction (which only rewrites the conversation) and
 //! process restarts. The sidecar is removed once the queue is fully
@@ -742,6 +747,11 @@ impl LineBuffer {
         self.bytes.is_empty()
     }
 
+    /// The full line contents, for whole-line redraws.
+    fn contents(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Decode the line; invalid UTF-8 (half-typed sequences) is an
     /// error rather than silently corrupted text.
     fn finish(&mut self) -> Result<String, std::string::FromUtf8Error> {
@@ -762,6 +772,7 @@ fn salvage_partial_line(
     buffer: &mut LineBuffer,
     browsing: Option<usize>,
     persist_fresh: bool,
+    line_visible: bool,
 ) {
     if let Some(position) = browsing {
         // Browsing is non-destructive, so the original is intact; save
@@ -787,7 +798,9 @@ fn salvage_partial_line(
     match (persist_fresh, line) {
         (true, Some(line)) => {
             queue.set_pending_draft(line.trim_end().to_string());
-            clear_echoed_line();
+            if line_visible {
+                clear_echoed_line();
+            }
             dim_note("(draft saved — it resumes at the prompt)");
         }
         _ => dim_note("(type-ahead in progress was discarded)"),
@@ -802,6 +815,30 @@ fn clear_echoed_line() {
     let _ = io::stdout().flush();
 }
 
+/// Take ownership of the current terminal row as the reader's input
+/// line: erase whatever frame or output occupies it, redraw the whole
+/// in-progress line, and park the cursor back on its edit position.
+/// While the line is owned, the progress ticker is muted (see
+/// [`crate::session::output::note_reader_keystroke`]), so nothing else
+/// redraws over it.
+fn redraw_input_line(buffer: &LineBuffer) {
+    print!("\r\x1b[K");
+    let _ = io::stdout().write_all(buffer.contents());
+    let tail_columns = char_columns(buffer.tail());
+    for _ in 0..tail_columns {
+        print!("\u{8}");
+    }
+    let _ = io::stdout().flush();
+}
+
+/// Hand the input line's row back to progress output: erase the echoed
+/// line (the draft stays in the buffer and reappears on the next
+/// keystroke) so a resuming spinner starts from a clean row.
+fn release_input_line() {
+    print!("\r\x1b[K");
+    let _ = io::stdout().flush();
+}
+
 fn reader_loop(
     stop: &AtomicBool,
     queue: &SharedQueue,
@@ -811,25 +848,57 @@ fn reader_loop(
     let mut buffer = LineBuffer::default();
     // 1-based queue position being browsed (non-destructive editing).
     let mut browsing: Option<usize> = None;
+    // Whether the reader currently owns the terminal's input row (the
+    // echoed line is on screen). Cleared after typing goes idle, when
+    // the row is released back to progress output.
+    let mut line_visible = false;
     loop {
         if stop.load(Ordering::Acquire) || cancel_token.is_cancelled() {
-            salvage_partial_line(queue, &mut buffer, browsing, true);
+            salvage_partial_line(queue, &mut buffer, browsing, true, line_visible);
             return ReaderExit::Stop;
         }
         if STDIN_YIELDED.load(Ordering::Acquire) {
-            salvage_partial_line(queue, &mut buffer, browsing, false);
+            salvage_partial_line(queue, &mut buffer, browsing, false, line_visible);
             return ReaderExit::Yielded;
         }
         let byte = match read_byte_timeout(50) {
             Ok(Some(byte)) => byte,
-            Ok(None) => continue,
+            Ok(None) => {
+                // Typing has been idle long enough: release the input
+                // row so the (about-to-resume) progress spinner starts
+                // from a clean line. The draft reappears on the next
+                // keystroke.
+                if line_visible && super::output::reader_should_release_line() {
+                    release_input_line();
+                    line_visible = false;
+                }
+                continue;
+            }
             Err(_) => {
-                salvage_partial_line(queue, &mut buffer, browsing, false);
+                salvage_partial_line(queue, &mut buffer, browsing, false, line_visible);
                 return ReaderExit::StdinError;
             }
         };
+        // Every byte is typing activity: it (re)opens the mute window
+        // that freezes animated progress output, and the first byte
+        // after an idle period retakes the input row.
+        let was_visible = line_visible;
+        super::output::note_reader_keystroke();
+        if !line_visible {
+            redraw_input_line(&buffer);
+            line_visible = true;
+            // The redraw erased any kernel-echoed bytes with the row,
+            // so the reader echoes everything from here on itself.
+            echo_suppressed = false;
+        }
         match byte {
             b'\r' | b'\n' => {
+                // A draft hidden by the idle release must not be
+                // submitted blindly: the Enter that reveals it is
+                // swallowed, the next one submits.
+                if !was_visible && !buffer.is_empty() {
+                    continue;
+                }
                 println!();
                 let line = match buffer.finish() {
                     Ok(line) => line,
@@ -1307,6 +1376,15 @@ mod tests {
     }
 
     #[test]
+    fn line_buffer_contents_expose_full_line_for_redraw() {
+        let mut buffer = LineBuffer::default();
+        buffer.push_str("draft");
+        assert_eq!(buffer.contents(), b"draft");
+        buffer.left();
+        assert_eq!(buffer.contents(), b"draft", "contents ignore cursor");
+    }
+
+    #[test]
     fn queue_numeric_browse_is_non_destructive() {
         let queue = SharedQueue::detached();
         queue.enqueue("one".into());
@@ -1381,7 +1459,7 @@ mod tests {
         // Final stop: fresh partial line is saved, not discarded.
         let mut buffer = LineBuffer::default();
         buffer.push_str("draft in progress");
-        salvage_partial_line(&queue, &mut buffer, None, true);
+        salvage_partial_line(&queue, &mut buffer, None, true, true);
         assert_eq!(
             queue.take_pending_draft().as_deref(),
             Some("draft in progress")
@@ -1392,16 +1470,16 @@ mod tests {
         queue.set_pending_draft("saved earlier".into());
         let mut buffer = LineBuffer::default();
         buffer.push_str("typed during yield");
-        salvage_partial_line(&queue, &mut buffer, None, false);
+        salvage_partial_line(&queue, &mut buffer, None, false, true);
         assert_eq!(queue.take_pending_draft().as_deref(), Some("saved earlier"));
 
         // Empty and whitespace-only buffers never produce a draft.
         let mut buffer = LineBuffer::default();
-        salvage_partial_line(&queue, &mut buffer, None, true);
+        salvage_partial_line(&queue, &mut buffer, None, true, true);
         assert!(queue.take_pending_draft().is_none());
         let mut buffer = LineBuffer::default();
         buffer.push_str("   ");
-        salvage_partial_line(&queue, &mut buffer, None, true);
+        salvage_partial_line(&queue, &mut buffer, None, true, true);
         assert!(queue.take_pending_draft().is_none());
     }
 
@@ -1411,7 +1489,7 @@ mod tests {
         queue.enqueue("original".into());
         let mut buffer = LineBuffer::default();
         buffer.push_str("edited");
-        salvage_partial_line(&queue, &mut buffer, Some(1), true);
+        salvage_partial_line(&queue, &mut buffer, Some(1), true, true);
         assert!(queue.take_pending_draft().is_none());
         assert_eq!(queue.message_at(1).as_deref(), Some("edited"));
     }
