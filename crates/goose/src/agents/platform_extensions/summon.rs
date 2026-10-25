@@ -64,65 +64,7 @@ pub struct DelegateParams {
     pub resume: Option<String>,
 }
 
-fn normalize_model_name(model: &str) -> String {
-    model
-        .to_lowercase()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect()
-}
-
-/// Split a model name into lowercase word and number tokens, merging adjacent
-/// numeric parts so "5.6", "5-6", and "56" all yield "56".
-fn model_tokens(model: &str) -> Vec<String> {
-    let lower = model.to_lowercase();
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_is_digits = false;
-    for c in lower.chars() {
-        if c.is_ascii_alphanumeric() {
-            let is_digit = c.is_ascii_digit();
-            if !current.is_empty() && current_is_digits != is_digit {
-                parts.push(std::mem::take(&mut current));
-            }
-            current_is_digits = is_digit;
-            current.push(c);
-        } else if !current.is_empty() {
-            parts.push(std::mem::take(&mut current));
-            current_is_digits = false;
-        }
-    }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    let mut tokens: Vec<String> = Vec::new();
-    for part in parts {
-        if part.chars().all(|c| c.is_ascii_digit()) {
-            if let Some(last) = tokens.last_mut() {
-                if last.chars().all(|c| c.is_ascii_digit()) {
-                    last.push_str(&part);
-                    continue;
-                }
-            }
-        }
-        tokens.push(part);
-    }
-    tokens
-}
-
-/// Token-level match: every requested token appears in the model's tokens
-/// (numeric tokens may be a prefix, so "5" matches "56"). This matches
-/// "luna 5.6" against "gpt-5.6-luna" regardless of word order.
-fn tokens_match(requested: &[String], model: &str) -> bool {
-    let model_tokens = model_tokens(model);
-    requested.iter().all(|token| {
-        model_tokens.iter().any(|candidate| {
-            candidate == token
-                || (token.chars().all(|c| c.is_ascii_digit())
-                    && candidate.starts_with(token.as_str()))
-        })
-    })
-}
+use crate::providers::model_resolution::model_tokens;
 
 const DEFAULT_RESUME_INSTRUCTIONS: &str = "Continue the task from where you left off.";
 
@@ -1716,29 +1658,7 @@ impl SummonClient {
     /// whose name contains the request is chosen, so a family name like "opus"
     /// or "luna" resolves to its most advanced variant.
     fn best_catalog_match(requested: &str, catalog: &[String]) -> Option<String> {
-        let normalized = normalize_model_name(requested);
-        if normalized.is_empty() {
-            return None;
-        }
-        if let Some(exact) = catalog
-            .iter()
-            .find(|model| normalize_model_name(model) == normalized)
-        {
-            return Some(exact.clone());
-        }
-        let requested_tokens = model_tokens(requested);
-        let mut candidates: Vec<String> = catalog
-            .iter()
-            .filter(|model| {
-                let model_normalized = normalize_model_name(model);
-                (model_normalized.len() > normalized.len()
-                    && model_normalized.contains(&normalized))
-                    || tokens_match(&requested_tokens, model)
-            })
-            .cloned()
-            .collect();
-        candidates.sort();
-        candidates.pop()
+        crate::providers::model_resolution::best_catalog_match(requested, catalog)
     }
 
     /// Names of providers that are configured and enabled.
