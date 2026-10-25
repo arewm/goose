@@ -255,6 +255,10 @@ pub struct CliSession {
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     loading_announced: bool,
+    /// Last (provider, model) that completed a turn successfully. A request
+    /// failure after a mid-session `/model` switch reverts to this so a bad
+    /// switch cannot brick the session.
+    last_good_model: Option<(String, goose_providers::model::ModelConfig)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,6 +347,7 @@ impl CliSession {
             stats,
             extension_loading,
             loading_announced: false,
+            last_good_model: None,
         }
     }
 
@@ -1601,8 +1606,11 @@ impl CliSession {
         let _typeahead_reader = interactive
             .then(|| queue::spawn_typeahead_reader(self.queue.clone(), cancel_token.clone()));
 
-        let mut stream = self
-            .agent
+        // Clone the agent handle so the reply stream borrows the local Arc
+        // rather than `self`; the post-turn model bookkeeping below needs
+        // `&mut self` while the stream is still alive.
+        let agent = Arc::clone(&self.agent);
+        let mut stream = agent
             .reply(
                 user_message.clone(),
                 session_config.clone(),
@@ -1834,6 +1842,11 @@ impl CliSession {
                 .messages
                 .last()
                 .is_some_and(|message| message.error_kind().is_some());
+        if failed {
+            self.revert_model_after_stream_failure().await;
+        } else {
+            self.record_last_good_model().await;
+        }
         let terminal_error = headless_run_error(
             interactive,
             cancel_token_clone.is_cancelled(),
@@ -2118,7 +2131,20 @@ impl CliSession {
             }
         }
 
-        cache.provider_names = all_providers.iter().map(|(m, _)| m.name.clone()).collect();
+        // Only providers explicitly configured (and enabled) in the user's
+        // config are offered for completion. Registry providers the user has
+        // never configured stay hidden here but remain reachable explicitly
+        // via `--provider` or GOOSE_PROVIDER, matching the env-var override
+        // workflow.
+        cache.provider_names = all_providers
+            .iter()
+            .filter(|(metadata, _)| {
+                providers::get_provider_entry(config, &metadata.name)
+                    .map(|entry| entry.enabled)
+                    .unwrap_or(false)
+            })
+            .map(|(metadata, _)| metadata.name.clone())
+            .collect();
         cache.current_session_provider = session_provider;
         cache.provider_models.clear();
         for (metadata, _) in &all_providers {
@@ -2189,6 +2215,70 @@ impl CliSession {
             .session_manager
             .get_session(&self.session_id, false)
             .await
+    }
+
+    /// Record the session's current (provider, model) as the last
+    /// configuration to complete a turn successfully.
+    async fn record_last_good_model(&mut self) {
+        if let (Ok(provider), Ok(model_config)) = (
+            self.agent.provider(&self.session_id).await,
+            self.agent.model_config_for_session(&self.session_id).await,
+        ) {
+            self.last_good_model = Some((provider.get_name().to_string(), model_config));
+        }
+    }
+
+    /// Revert to the last model that completed a turn successfully when a
+    /// request fails, so a mid-session `/model` switch to an unavailable
+    /// model cannot leave the session stuck. Transient failures on an
+    /// established model do not revert: its last successful turn already
+    /// recorded it as known-good, so current and last-good match.
+    async fn revert_model_after_stream_failure(&mut self) {
+        let Some((provider_name, model_config)) = self.last_good_model.clone() else {
+            return;
+        };
+        let current_model = self
+            .agent
+            .model_config_for_session(&self.session_id)
+            .await
+            .ok()
+            .map(|config| config.model_name);
+        let current_provider = self
+            .agent
+            .provider(&self.session_id)
+            .await
+            .ok()
+            .map(|provider| provider.get_name().to_string());
+        if current_model.as_deref() == Some(model_config.model_name.as_str())
+            && current_provider.as_deref() == Some(provider_name.as_str())
+        {
+            return;
+        }
+        let switched_to = current_model.unwrap_or_else(|| "unknown".to_string());
+        let target_model = model_config.model_name.clone();
+        match self
+            .agent
+            .switch_provider(&self.session_id, &provider_name, model_config)
+            .await
+        {
+            Ok(()) => {
+                output::render_text(
+                    &format!(
+                        "Request failed on model '{switched_to}'. Reverted to provider \
+                         '{provider_name}' / model '{target_model}' so the session stays \
+                         usable; the failed model may be unavailable (check with /model).",
+                    ),
+                    Some(Color::Yellow),
+                    true,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to revert to provider '{provider_name}' / model \
+                     '{target_model}' after a stream error: {error}"
+                );
+            }
+        }
     }
 
     /// Resolve a `/model <name>` request against provider catalogs.
@@ -2268,7 +2358,7 @@ impl CliSession {
                 .unwrap_or(false)
                 && goose::config::get_provider_entry(Config::global(), &metadata.name)
                     .map(|entry| entry.enabled)
-                    .unwrap_or(true);
+                    .unwrap_or(false);
             if !configured {
                 continue;
             }

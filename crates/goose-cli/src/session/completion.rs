@@ -11,6 +11,27 @@ use strum::VariantNames;
 
 use super::{CompletionCache, HintStatus};
 
+/// Token-aware completion match: every completed token of the partial must
+/// appear as a token of the candidate name, and the trailing (possibly
+/// still-being-typed) token may be a prefix of any candidate token. This
+/// matches the `/model` resolver's tokenization, so "luna" completes
+/// `gpt-6-luna` and "anthropic" completes `enmaas-anthropic` instead of
+/// requiring the candidate to start with the partial.
+fn completion_tokens_match(partial: &str, name: &str) -> bool {
+    let partial_tokens = goose::providers::model_resolution::model_tokens(partial);
+    if partial_tokens.is_empty() {
+        return true;
+    }
+    let name_tokens = goose::providers::model_resolution::model_tokens(name);
+    let (last, complete) = partial_tokens.split_last().expect("non-empty");
+    complete
+        .iter()
+        .all(|token| name_tokens.iter().any(|candidate| candidate == token))
+        && name_tokens
+            .iter()
+            .any(|candidate| candidate.starts_with(last))
+}
+
 /// Completer for goose CLI commands
 pub struct GooseCompleter {
     pub completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
@@ -164,7 +185,7 @@ impl GooseCompleter {
                 let candidates: Vec<Pair> = cache
                     .provider_names
                     .iter()
-                    .filter(|name| name.starts_with(partial))
+                    .filter(|name| completion_tokens_match(partial, name))
                     .map(|name| Pair {
                         display: name.clone(),
                         replacement: format!("{} ", name),
@@ -219,7 +240,7 @@ impl GooseCompleter {
         let candidates: Vec<Pair> = match models {
             Some(names) if !names.is_empty() => names
                 .iter()
-                .filter(|name| name.starts_with(partial))
+                .filter(|name| completion_tokens_match(partial, name))
                 .map(|name| Pair {
                     display: name.clone(),
                     replacement: format!("{} ", name),
@@ -927,5 +948,20 @@ mod tests {
             .complete_argument_keys("/prompt nonexistent")
             .unwrap();
         assert_eq!(candidates.len(), 0);
+    }
+
+    #[test]
+    fn completion_tokens_match_matches_any_token_not_just_prefix() {
+        // Trailing partial token may be a prefix of any candidate token.
+        assert!(completion_tokens_match("luna", "gpt-6-luna"));
+        assert!(completion_tokens_match("lu", "gpt-6-luna"));
+        assert!(completion_tokens_match("anthropic", "enmaas-anthropic"));
+        assert!(completion_tokens_match("enmaas an", "enmaas-anthropic"));
+        assert!(completion_tokens_match("gpt 5", "gpt-5.6-luna"));
+        assert!(completion_tokens_match("", "anything"));
+        // Completed tokens must all appear in the candidate.
+        assert!(!completion_tokens_match("luna 5.6", "gpt-6-luna"));
+        assert!(!completion_tokens_match("opus", "gpt-6-luna"));
+        assert!(!completion_tokens_match("sol", "glm-5-3"));
     }
 }
