@@ -31,6 +31,13 @@ use tracing::warn;
 
 pub static EXTENSION_NAME: &str = "summon";
 
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
+const CATALOG_CACHE_NEGATIVE_TTL: Duration = Duration::from_secs(60);
+const PERSISTED_CATALOG_MAX_AGE_HOURS: i64 = 24;
+type CatalogCache = std::sync::Mutex<HashMap<String, (Instant, Option<Vec<String>>)>>;
+static CATALOG_CACHE: once_cell::sync::Lazy<CatalogCache> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
 const SUBAGENT_DESCRIPTION_BUDGET: usize = 160;
 
 fn kind_plural(kind: SourceType) -> &'static str {
@@ -55,6 +62,66 @@ pub struct DelegateParams {
     pub context: Option<String>,
     pub working_dir: Option<String>,
     pub resume: Option<String>,
+}
+
+fn normalize_model_name(model: &str) -> String {
+    model
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect()
+}
+
+/// Split a model name into lowercase word and number tokens, merging adjacent
+/// numeric parts so "5.6", "5-6", and "56" all yield "56".
+fn model_tokens(model: &str) -> Vec<String> {
+    let lower = model.to_lowercase();
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_is_digits = false;
+    for c in lower.chars() {
+        if c.is_ascii_alphanumeric() {
+            let is_digit = c.is_ascii_digit();
+            if !current.is_empty() && current_is_digits != is_digit {
+                parts.push(std::mem::take(&mut current));
+            }
+            current_is_digits = is_digit;
+            current.push(c);
+        } else if !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+            current_is_digits = false;
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    for part in parts {
+        if part.chars().all(|c| c.is_ascii_digit()) {
+            if let Some(last) = tokens.last_mut() {
+                if last.chars().all(|c| c.is_ascii_digit()) {
+                    last.push_str(&part);
+                    continue;
+                }
+            }
+        }
+        tokens.push(part);
+    }
+    tokens
+}
+
+/// Token-level match: every requested token appears in the model's tokens
+/// (numeric tokens may be a prefix, so "5" matches "56"). This matches
+/// "luna 5.6" against "gpt-5.6-luna" regardless of word order.
+fn tokens_match(requested: &[String], model: &str) -> bool {
+    let model_tokens = model_tokens(model);
+    requested.iter().all(|token| {
+        model_tokens.iter().any(|candidate| {
+            candidate == token
+                || (token.chars().all(|c| c.is_ascii_digit())
+                    && candidate.starts_with(token.as_str()))
+        })
+    })
 }
 
 const DEFAULT_RESUME_INSTRUCTIONS: &str = "Continue the task from where you left off.";
@@ -389,8 +456,12 @@ fn build_subagent_instructions(sources: &[SourceEntry]) -> String {
          context. For long-running work, pass `async: true` to `delegate` — \
          it returns a task id immediately, and you collect the result later \
          using `load` with the returned task ID to wait for completion.\n\n\
-         When overriding subagent models, use the appropriate configured provider \
-         (e.g. `gcp_vertex_ai` for Google Gemini models, `openai` for OpenAI models).",
+         When overriding subagent models, pass a model family name (e.g. `opus`, \
+         `luna`, `sonnet`), optionally with a version (e.g. `luna 5.6`) — goose \
+         resolves it against each provider's live catalog and picks the most \
+         advanced matching variant, routing to a provider that serves it if \
+         needed. If nothing matches, the error lists the closest available \
+         models; retry with one of those instead of inventing model IDs.",
     ));
 
     out
@@ -509,7 +580,7 @@ impl SummonClient {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Override model."
+                    "description": "Override model. Prefer a family name (e.g. 'opus', 'luna'), optionally with a version (e.g. 'luna 5.6'); goose resolves it to the best available match and errors with suggestions if none matches."
                 },
                 "temperature": {
                     "type": "number",
@@ -953,6 +1024,10 @@ impl SummonClient {
             })?;
 
         let max_turns = subagent_config.max_turns;
+        let subagent_runtime = format!(
+            "{} / {}",
+            subagent_config.provider_name, subagent_config.model_config.model_name
+        );
         recipe
             .settings
             .get_or_insert(Settings {
@@ -1016,7 +1091,10 @@ impl SummonClient {
             .map_err(|e| format!("Failed to save delegate task: {e}"))?;
 
         Ok(delegated_result(
-            format!("Delegated to subagent {}", child.id),
+            format!(
+                "Delegated to subagent {} (running on {})",
+                child.id, subagent_runtime
+            ),
             &child.id,
         ))
     }
@@ -1486,7 +1564,249 @@ impl SummonClient {
             &provider_name,
             provider_default_model,
         )?;
+
+        // Catalog-aware model resolution: delegations used to pass whatever
+        // model string the recipe or caller supplied straight to the provider,
+        // so a model from another family (e.g. an agent file pinning an OpenAI
+        // model while the session runs a custom Anthropic-compatible provider)
+        // failed at request time with an opaque 404.
+        let (mut provider_name, mut model_config) = (provider_name, model_config);
+        if let Some(catalog) = self.provider_catalog(&provider_name).await {
+            match Self::best_catalog_match(&model_config.model_name, &catalog) {
+                Some(matched) => {
+                    if matched != model_config.model_name {
+                        warn!(
+                            "Delegate model '{}' resolved to '{}' on provider '{}'",
+                            model_config.model_name, matched, provider_name
+                        );
+                        model_config.model_name = matched;
+                    }
+                }
+                None => {
+                    let session_model_matches = session
+                        .model_config
+                        .as_ref()
+                        .filter(|_| {
+                            session.provider_name.as_deref() == Some(provider_name.as_str())
+                        })
+                        .map(|config| config.model_name.clone())
+                        .filter(|model| Self::best_catalog_match(model, &catalog).is_some());
+                    if params.model.is_some() && params.provider.is_none() {
+                        let (best, suggestions) = self
+                            .sweep_configured_providers(&model_config.model_name)
+                            .await;
+                        if let Some((alt_provider, alt_model)) = best {
+                            warn!(
+                                "No model '{}' on provider '{}'; delegating to provider \
+                                 '{}' as model '{}'",
+                                model_config.model_name, provider_name, alt_provider, alt_model
+                            );
+                            provider_name = alt_provider;
+                            model_config.model_name = alt_model;
+                            return Ok((provider_name, model_config));
+                        }
+                        let suggestions = suggestions.join(", ");
+                        anyhow::bail!(
+                            "No configured provider serves a model matching '{}'. {}",
+                            model_config.model_name,
+                            if suggestions.is_empty() {
+                                "Pass a model family name (e.g. 'opus', 'luna') or leave \
+                                 model unset to use the session model."
+                                    .to_string()
+                            } else {
+                                format!("Closest available models: {suggestions}.")
+                            }
+                        );
+                    }
+                    if let Some(session_model) = session_model_matches {
+                        warn!(
+                            "Delegate model '{}' is not served by provider '{}'; \
+                             falling back to session model '{}'",
+                            model_config.model_name, provider_name, session_model
+                        );
+                        model_config.model_name = session_model;
+                    }
+                }
+            }
+        }
         Ok((provider_name, model_config))
+    }
+
+    async fn provider_catalog(&self, provider_name: &str) -> Option<Vec<String>> {
+        if let Some((fetched_at, cached)) =
+            CATALOG_CACHE.lock().unwrap().get(provider_name).cloned()
+        {
+            let ttl = if cached.is_some() {
+                CATALOG_CACHE_TTL
+            } else {
+                CATALOG_CACHE_NEGATIVE_TTL
+            };
+            if fetched_at.elapsed() < ttl {
+                return cached;
+            }
+        }
+        if let Some(persisted) = self.persisted_catalog(provider_name).await {
+            CATALOG_CACHE.lock().unwrap().insert(
+                provider_name.to_string(),
+                (Instant::now(), Some(persisted.clone())),
+            );
+            return Some(persisted);
+        }
+        let fetched = match providers::create(provider_name, Vec::new()).await {
+            Ok(provider) => match provider.fetch_supported_models().await {
+                Ok(models) if !models.is_empty() => Some(models),
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(
+                        "Could not fetch model catalog for provider '{}' ({}); \
+                         skipping catalog-based model resolution",
+                        provider_name, error
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                warn!(
+                    "Could not construct provider '{}' for a catalog fetch ({}); \
+                     skipping catalog-based model resolution",
+                    provider_name, error
+                );
+                None
+            }
+        };
+        if let Some(models) = &fetched {
+            let service = crate::providers::inventory::ProviderInventoryService::new(
+                self.context.session_manager.storage().clone(),
+            );
+            if let Err(error) = service.store_refreshed_models(provider_name, models).await {
+                warn!(
+                    "Could not persist model catalog for provider '{}' ({}); \
+                     routing continues from the in-memory result",
+                    provider_name, error
+                );
+            }
+        }
+        CATALOG_CACHE
+            .lock()
+            .unwrap()
+            .insert(provider_name.to_string(), (Instant::now(), fetched.clone()));
+        fetched
+    }
+
+    /// The provider's last refreshed catalog from the persisted inventory
+    /// (shared with the desktop UI), usable without a network round trip.
+    /// Only a snapshot refreshed within the staleness window counts; entries
+    /// that were never refreshed fall through to a live fetch.
+    async fn persisted_catalog(&self, provider_name: &str) -> Option<Vec<String>> {
+        let service = crate::providers::inventory::ProviderInventoryService::new(
+            self.context.session_manager.storage().clone(),
+        );
+        let entry = service.entry_for_provider(provider_name).await.ok()??;
+        let updated_at = entry.last_updated_at?;
+        let age_hours = (chrono::Utc::now() - updated_at).num_hours();
+        if !(0..=PERSISTED_CATALOG_MAX_AGE_HOURS).contains(&age_hours) {
+            return None;
+        }
+        let models: Vec<String> = entry.models.into_iter().map(|model| model.id).collect();
+        (!models.is_empty()).then_some(models)
+    }
+
+    /// Resolve a requested model name against a provider's catalog. An exact
+    /// (normalized) match wins; otherwise the lexicographically greatest model
+    /// whose name contains the request is chosen, so a family name like "opus"
+    /// or "luna" resolves to its most advanced variant.
+    fn best_catalog_match(requested: &str, catalog: &[String]) -> Option<String> {
+        let normalized = normalize_model_name(requested);
+        if normalized.is_empty() {
+            return None;
+        }
+        if let Some(exact) = catalog
+            .iter()
+            .find(|model| normalize_model_name(model) == normalized)
+        {
+            return Some(exact.clone());
+        }
+        let requested_tokens = model_tokens(requested);
+        let mut candidates: Vec<String> = catalog
+            .iter()
+            .filter(|model| {
+                let model_normalized = normalize_model_name(model);
+                (model_normalized.len() > normalized.len()
+                    && model_normalized.contains(&normalized))
+                    || tokens_match(&requested_tokens, model)
+            })
+            .cloned()
+            .collect();
+        candidates.sort();
+        candidates.pop()
+    }
+
+    /// Names of providers that are configured and enabled.
+    async fn configured_provider_names(&self) -> Vec<String> {
+        let config = Config::global();
+        let mut names = Vec::new();
+        for (metadata, _) in providers::providers().await {
+            let configured = providers::get_from_registry(&metadata.name)
+                .await
+                .map(|entry| entry.inventory_configured())
+                .unwrap_or(false)
+                && crate::config::get_provider_entry(config, &metadata.name)
+                    .map(|entry| entry.enabled)
+                    .unwrap_or(true);
+            if configured {
+                names.push(metadata.name);
+            }
+        }
+        names
+    }
+
+    /// Sweep every configured provider's catalog in parallel, in a single
+    /// pass. Returns the best matching (provider, model) plus the closest
+    /// suggestions by shared token for error messages when nothing matched.
+    async fn sweep_configured_providers(
+        &self,
+        requested: &str,
+    ) -> (Option<(String, String)>, Vec<String>) {
+        let names = self.configured_provider_names().await;
+        let catalogs = futures::future::join_all(
+            names
+                .iter()
+                .map(|name| async move { (name.clone(), self.provider_catalog(name).await) }),
+        )
+        .await;
+
+        let mut best: Option<(String, String)> = None;
+        let mut suggestions: Vec<String> = Vec::new();
+        let requested_tokens = model_tokens(requested);
+        for (name, catalog) in catalogs {
+            let Some(catalog) = catalog else {
+                continue;
+            };
+            if let Some(model) = Self::best_catalog_match(requested, &catalog) {
+                let is_better = best
+                    .as_ref()
+                    .is_none_or(|(_, best_model)| model > *best_model);
+                if is_better {
+                    best = Some((name.clone(), model));
+                }
+            }
+            for model in catalog {
+                let shares_token = model_tokens(&model).iter().any(|token| {
+                    requested_tokens.iter().any(|requested| {
+                        token == requested
+                            || (token.chars().all(|c| c.is_ascii_digit())
+                                && token.starts_with(requested.as_str()))
+                    })
+                });
+                if shares_token {
+                    suggestions.push(format!("{model} ({name})"));
+                }
+            }
+        }
+        suggestions.sort();
+        suggestions.dedup();
+        suggestions.truncate(8);
+        (best, suggestions)
     }
 
     fn resolve_max_turns(params: &DelegateParams, recipe: &Recipe, config: &Config) -> usize {
@@ -1684,6 +2004,53 @@ mod tests {
             session_manager,
             scheduler: None,
         }
+    }
+
+    #[test]
+    fn best_catalog_match_prefers_exact_then_most_advanced_variant() {
+        let catalog = vec![
+            "claude-opus-4-8".to_string(),
+            "claude-opus-5".to_string(),
+            "claude-opus-5-5".to_string(),
+            "claude-sonnet-5-5".to_string(),
+        ];
+        assert_eq!(
+            super::SummonClient::best_catalog_match("opus", &catalog),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("claude-opus-5", &catalog),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("CLAUDE_OPUS_5", &catalog),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("haiku", &catalog),
+            None
+        );
+    }
+
+    #[test]
+    fn best_catalog_match_handles_version_qualified_family_names() {
+        let catalog = vec![
+            "gpt-5.6-luna".to_string(),
+            "gpt-6-luna".to_string(),
+            "gpt-5.4".to_string(),
+        ];
+        assert_eq!(
+            super::SummonClient::best_catalog_match("luna 5.6", &catalog),
+            Some("gpt-5.6-luna".to_string())
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("luna-5.4", &catalog),
+            None
+        );
+        assert_eq!(
+            super::SummonClient::best_catalog_match("luna", &catalog),
+            Some("gpt-6-luna".to_string())
+        );
     }
 
     #[tokio::test]
