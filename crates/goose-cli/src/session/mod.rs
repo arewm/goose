@@ -1092,11 +1092,37 @@ impl CliSession {
         let current_model_name = current_model_config.model_name.clone();
 
         if options.provider.is_none() && options.model.is_none() {
+            if let Some(effort) = options.effort.as_deref() {
+                if effort.is_empty() {
+                    output::render_error("A value is required after '--effort'.");
+                    return Ok(());
+                }
+                match self
+                    .agent
+                    .update_thinking_effort(&self.session_id, effort)
+                    .await
+                {
+                    Ok(()) => output::goose_mode_message(&format!(
+                        "Session thinking effort set to '{effort}' for model '{}' (provider '{}')",
+                        current_model_name, current_provider_name
+                    )),
+                    Err(e) => {
+                        output::render_error(&format!("Failed to set thinking effort: {e}"));
+                    }
+                }
+                return Ok(());
+            }
             output::goose_mode_message(&format!(
                 "Current session model: '{}' (provider '{}')\n\
-                 Tip: use '/model <name>' to switch model, or '/model --provider <name> [model]' to switch provider.",
+                 Tip: use '/model <name>' to switch model, '/model --provider <name> [model]' to switch provider,\n\
+                 or '/model --effort <level> [name]' to change the thinking effort.",
                 current_model_name, current_provider_name
             ));
+            return Ok(());
+        }
+
+        if options.effort.as_deref().is_some_and(str::is_empty) {
+            output::render_error("A value is required after '--effort'.");
             return Ok(());
         }
 
@@ -1138,6 +1164,16 @@ impl CliSession {
             return Ok(());
         }
 
+        // A mistyped flag (`--efort`) reaches here as model text because the
+        // token walker only recognizes exact flag names; calling that out
+        // beats the generic multi-argument error.
+        if let Some(model) = options.model.as_deref().filter(|m| m.starts_with("--")) {
+            let flag = model.split_whitespace().next().unwrap_or(model);
+            output::render_error(&format!(
+                "Unknown flag '{flag}'. Supported flags: --provider <name>, --effort <level>."
+            ));
+            return Ok(());
+        }
         if options
             .model
             .as_deref()
@@ -1308,6 +1344,23 @@ impl CliSession {
             .await?;
 
         self.update_completion_cache().await?;
+
+        if let Some(effort) = options.effort.as_deref() {
+            match self
+                .agent
+                .update_thinking_effort(&self.session_id, effort)
+                .await
+            {
+                Ok(()) => output::goose_mode_message(&format!(
+                    "Session thinking effort set to '{effort}'"
+                )),
+                Err(e) => {
+                    output::render_error(&format!(
+                        "Model switched, but the thinking effort was not set: {e}"
+                    ));
+                }
+            }
+        }
 
         if provider_unchanged {
             output::goose_mode_message(&format!(

@@ -204,18 +204,52 @@ impl GooseCompleter {
             return self.models_completion_from_cache(provider_name, partial, line);
         }
 
-        if after_cmd.starts_with("--") {
-            let flag_partial = &after_cmd;
-            if "--provider".starts_with(flag_partial) {
-                return Ok((
-                    line.len() - flag_partial.len(),
-                    vec![Pair {
-                        display: "--provider".to_string(),
-                        replacement: "--provider ".to_string(),
-                    }],
-                ));
+        if after_cmd == "--effort" || after_cmd.starts_with("--effort ") {
+            if after_cmd == "--effort" {
+                return Ok((line.len(), vec![]));
             }
-            return Ok((line.len(), vec![]));
+            let flag_rest = after_cmd.strip_prefix("--effort").unwrap_or("").trim();
+            let parts: Vec<&str> = flag_rest.split_whitespace().collect();
+            let trailing_space = after_cmd.ends_with(' ');
+            if parts.is_empty() || (parts.len() == 1 && !trailing_space) {
+                let partial = parts.first().copied().unwrap_or("");
+                let candidates: Vec<Pair> = ["off", "low", "medium", "high", "max"]
+                    .iter()
+                    .filter(|effort| completion_tokens_match(partial, effort))
+                    .map(|effort| Pair {
+                        display: effort.to_string(),
+                        replacement: format!("{} ", effort),
+                    })
+                    .collect();
+                return Ok((line.len() - partial.len(), candidates));
+            }
+            let current_provider = {
+                let cache = self.completion_cache.read().unwrap();
+                if cache.current_session_provider.is_empty() {
+                    Config::global().get_goose_provider().unwrap_or_default()
+                } else {
+                    cache.current_session_provider.clone()
+                }
+            };
+            let partial = if trailing_space {
+                ""
+            } else {
+                parts.last().copied().unwrap_or("")
+            };
+            return self.models_completion_from_cache(&current_provider, partial, line);
+        }
+
+        if after_cmd.starts_with("--") {
+            let flags = ["--provider", "--effort"];
+            let candidates: Vec<Pair> = flags
+                .iter()
+                .filter(|flag| flag.starts_with(after_cmd))
+                .map(|flag| Pair {
+                    display: flag.to_string(),
+                    replacement: format!("{} ", flag),
+                })
+                .collect();
+            return Ok((line.len() - after_cmd.len(), candidates));
         }
 
         let current_provider = {
@@ -792,6 +826,33 @@ mod tests {
         assert_eq!(pos, "/model ".len());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].display, "--provider");
+    }
+
+    #[test]
+    fn test_complete_model_effort_values() {
+        let cache = create_test_cache();
+        let completer = GooseCompleter::new(cache);
+
+        let (pos, candidates) = completer.complete_model_names("/model --effort l").unwrap();
+        assert_eq!(pos, "/model --effort ".len());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "low");
+
+        let (_pos, candidates) = completer.complete_model_names("/model --effort ").unwrap();
+        assert_eq!(candidates.len(), 5);
+
+        // Once the effort value is complete, completion falls through to
+        // model names for the current session provider.
+        let (_pos, candidates) = completer
+            .complete_model_names("/model --effort low claude-s")
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "claude-sonnet-4");
+
+        // Flag-prefix completion offers both flags.
+        let (_pos, candidates) = completer.complete_model_names("/model --e").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].display, "--effort");
     }
 
     #[test]
