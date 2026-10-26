@@ -452,6 +452,13 @@ impl CbreakGuard {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        // Ask the terminal to bracket pastes with ESC[200~ / ESC[201~ so
+        // multi-line pastes can be queued as a single message instead of
+        // one message per line. Disabled again on drop.
+        if isig {
+            print!("\x1b[?2004h");
+            let _ = io::stdout().flush();
+        }
         Ok(Self {
             original,
             active: true,
@@ -463,6 +470,10 @@ impl Drop for CbreakGuard {
     fn drop(&mut self) {
         if self.active {
             let fd = io::stdin().as_raw_fd();
+            // Disable bracketed paste before restoring modes so the
+            // terminal stops wrapping pastes in markers.
+            print!("\x1b[?2004l");
+            let _ = io::stdout().flush();
             // SAFETY: restoring saved terminal state.
             unsafe { libc::tcsetattr(fd, libc::TCSANOW, &self.original) };
         }
@@ -831,6 +842,57 @@ fn redraw_input_line(buffer: &LineBuffer) {
     let _ = io::stdout().flush();
 }
 
+/// The bracketed-paste end marker bytes (ESC [ 2 0 1 ~).
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Read a bracketed-paste payload up to (and stripping) the end marker.
+/// Bytes are accumulated raw and decoded as UTF-8 at the end; a stalled
+/// paste (no byte within the timeout) is treated as terminated so the
+/// reader can never wedge on a truncated sequence.
+fn read_paste_payload() -> Result<String, std::str::Utf8Error> {
+    let mut payload: Vec<u8> = Vec::new();
+    while let Ok(Some(byte)) = read_byte_timeout(100) {
+        payload.push(byte);
+        if payload.ends_with(PASTE_END) {
+            payload.truncate(payload.len() - PASTE_END.len());
+            break;
+        }
+    }
+    std::str::from_utf8(&payload).map(|text| text.to_string())
+}
+
+/// Queue a pasted payload. A single-line paste behaves exactly like
+/// typed input (queue commands are interpreted, text is queued); a
+/// multi-line paste is queued as one message so pasted content is never
+/// split across queue entries.
+fn enqueue_paste(queue: &SharedQueue, payload: &str) {
+    let text = payload.trim_end_matches(['\r', '\n']);
+    if text.trim().is_empty() {
+        return;
+    }
+    if !text.contains('\n') {
+        if is_queue_command(text.trim()) {
+            match interpret_queue_command(queue, text.trim()) {
+                QueueCommandOutcome::Notice(notice) => dim_note(&notice),
+                QueueCommandOutcome::Browse { position } => {
+                    if let Some(message) = queue.message_at(position) {
+                        dim_note(&format!("(browsing message {position}: {message})"));
+                    }
+                }
+            }
+        } else {
+            let count = queue.enqueue(text.trim_end().to_string());
+            dim_note(&format!("queued ({count} pending)"));
+        }
+        return;
+    }
+    let count = queue.enqueue(text.to_string());
+    let lines = text.lines().count();
+    dim_note(&format!(
+        "pasted {lines} lines — queued as one message ({count} pending)"
+    ));
+}
+
 /// Hand the input line's row back to progress output: erase the echoed
 /// line (the draft stays in the buffer and reappears on the next
 /// keystroke) so a resuming spinner starts from a clean row.
@@ -892,7 +954,24 @@ fn reader_loop(
             echo_suppressed = false;
         }
         match byte {
-            b'\r' | b'\n' => {
+            // Ctrl+J inserts a literal newline so multi-line messages can
+            // be typed into the queue, mirroring the main prompt's
+            // "Enter to send · Ctrl+J newline" binding.
+            b'\n' => {
+                buffer.insert(b'\n');
+                if !echo_suppressed {
+                    println!();
+                    let tail: Vec<u8> = buffer.tail().to_vec();
+                    if !tail.is_empty() {
+                        let _ = io::stdout().write_all(&tail);
+                        for _ in 0..char_columns(&tail) {
+                            print!("\u{8}");
+                        }
+                    }
+                    let _ = io::stdout().flush();
+                }
+            }
+            b'\r' => {
                 // A draft hidden by the idle release must not be
                 // submitted blindly: the Enter that reveals it is
                 // swallowed, the next one submits.
@@ -973,21 +1052,41 @@ fn reader_loop(
                 if let Some(follow) = follow {
                     // Escape sequence: read to the final byte
                     // (0x40..=0x7E). Left/right/home/end move the edit
-                    // cursor; everything else (other navigation keys,
-                    // bracketed-paste markers) is ignored. Paste payloads
-                    // between markers arrive as plain bytes and queue
-                    // line-by-line, like typed input.
+                    // cursor; everything else (other navigation keys) is
+                    // ignored. Bracketed-paste markers bracket a pasted
+                    // payload, which is queued as a single multi-line
+                    // message (see read_paste_payload).
                     if follow == b'[' || follow == b'O' {
                         let mut final_byte = None;
+                        let mut intermediates: Vec<u8> = Vec::new();
                         for _ in 0..16 {
                             match read_byte_timeout(10) {
                                 Ok(Some(byte)) if (0x40..=0x7e).contains(&byte) => {
                                     final_byte = Some(byte);
                                     break;
                                 }
-                                Ok(Some(_)) => continue,
+                                Ok(Some(byte)) => intermediates.push(byte),
                                 _ => break,
                             }
+                        }
+                        // Bracketed paste start: swallow everything up to
+                        // the end marker and queue the payload as a single
+                        // multi-line message instead of one message per
+                        // line.
+                        if final_byte == Some(b'~') && intermediates == b"200" {
+                            match read_paste_payload() {
+                                Ok(payload) => {
+                                    enqueue_paste(queue, &payload);
+                                    buffer = LineBuffer::default();
+                                    browsing = None;
+                                }
+                                Err(_) => dim_note("(paste discarded: invalid UTF-8)"),
+                            }
+                            continue;
+                        }
+                        if final_byte == Some(b'~') && intermediates == b"201" {
+                            // Stray paste end marker; ignore.
+                            continue;
                         }
                         // Up/down arrows walk the queue like shell
                         // history: browsing is non-destructive, Enter
@@ -1110,11 +1209,12 @@ fn reader_loop(
 // ── /queue edit: rebase-style plan file ────────────────────────────────
 
 const PLAN_HEADER: &str = "\
-# Queued messages, in send order. Each message is one line starting
-# with '- '. Edit freely: reorder, retext, or delete lines; empty the
-# list to clear the queue. Lines starting with '#' are comments; any
-# other non-blank line is an error and aborts the apply. Save and quit
-# to apply; quit without saving to abort.";
+# Queued messages, in send order. Each message starts with '- ' on its
+# first line; additional lines of a multi-line message are indented by
+# two spaces. Edit freely: reorder, retext, or delete messages; empty
+# the list to clear the queue. Lines starting with '#' are comments;
+# any other non-blank line is an error and aborts the apply. Save and
+# quit to apply; quit without saving to abort.";
 
 /// Open the queue in the user's editor as a plan file. Returns `None`
 /// when the editor exited unsuccessfully (abort), `Some(Ok(messages))`
@@ -1144,9 +1244,15 @@ pub fn edit_queue_plan(messages: &[String]) -> anyhow::Result<Option<anyhow::Res
         .tempfile()?;
     writeln!(file, "{PLAN_HEADER}")?;
     for message in messages {
-        // Single-line plan entries: newlines inside a message become
-        // spaces so the file stays one-message-per-line.
-        writeln!(file, "- {}", message.replace('\n', " "))?;
+        // Multi-line messages round-trip: the first line carries the
+        // '- ' prefix, continuation lines are indented two spaces.
+        let mut lines = message.lines();
+        if let Some(first) = lines.next() {
+            writeln!(file, "- {first}")?;
+        }
+        for line in lines {
+            writeln!(file, "  {line}")?;
+        }
     }
     file.flush()?;
     let path = file.path().to_path_buf();
@@ -1169,14 +1275,27 @@ pub fn edit_queue_plan(messages: &[String]) -> anyhow::Result<Option<anyhow::Res
     Ok(Some(parse_plan(&content)))
 }
 
-/// Parse a plan file into messages: each `- ` line is one message, `#`
-/// lines are comments, blank lines are ignored, anything else is an
-/// error. Pure so it can be unit tested.
+/// Parse a plan file into messages: each `- ` line starts a message,
+/// subsequent lines indented by two spaces continue it (joined with
+/// newlines), `#` lines are comments, blank lines are ignored, anything
+/// else is an error. Pure so it can be unit tested.
 pub fn parse_plan(content: &str) -> anyhow::Result<Vec<String>> {
-    let mut messages = Vec::new();
+    let mut messages: Vec<String> = Vec::new();
     for (number, line) in content.lines().enumerate() {
         let line = line.trim_end();
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(continuation) = line.strip_prefix("  ") {
+            let Some(last) = messages.last_mut() else {
+                return Err(anyhow::anyhow!(
+                    "line {}: continuation line with no preceding '- ' message: {:?}",
+                    number + 1,
+                    preview_line(line, 40)
+                ));
+            };
+            last.push('\n');
+            last.push_str(continuation);
             continue;
         }
         let Some(message) = line.strip_prefix("- ") else {
@@ -1218,6 +1337,46 @@ mod tests {
     fn parse_plan_ignores_comments_and_blanks() {
         let plan = "# header\n- first\n\n  # indented comment\n-  second  \n\n";
         assert_eq!(parse_plan(plan).unwrap(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn parse_plan_joins_continuation_lines_into_one_message() {
+        let plan = "- first line\n  second line\n  third\n- next message";
+        assert_eq!(
+            parse_plan(plan).unwrap(),
+            vec!["first line\nsecond line\nthird", "next message"]
+        );
+    }
+
+    #[test]
+    fn parse_plan_rejects_continuation_without_message() {
+        let plan = "  orphan continuation\n";
+        let error = parse_plan(plan).unwrap_err().to_string();
+        assert!(error.contains("continuation"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn enqueue_paste_queues_multiline_payload_as_one_message() {
+        let queue = SharedQueue::detached();
+        enqueue_paste(&queue, "line one\nline two\nline three\n");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.message_at(1).as_deref(),
+            Some("line one\nline two\nline three")
+        );
+    }
+
+    #[test]
+    fn enqueue_paste_single_line_behaves_like_typed_input() {
+        let queue = SharedQueue::detached();
+        enqueue_paste(&queue, "just text\n");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.message_at(1).as_deref(), Some("just text"));
+        // Single-line queue commands are intercepted, not queued.
+        let command_queue = SharedQueue::detached();
+        enqueue_paste(&command_queue, "/queue edit\n");
+        assert!(command_queue.is_empty());
+        assert!(command_queue.take_pending_edit());
     }
 
     #[test]
