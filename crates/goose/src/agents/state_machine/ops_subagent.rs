@@ -574,7 +574,11 @@ mod tests {
         assert!(matches!(
             notice.content.as_slice(),
             [MessageContent::SystemNotification(notification)]
-                if notification.msg == format!("Resuming subagent {}", fixture.subagent_id)
+                if notification.msg
+                    == format!(
+                        "Resuming subagent {} (unknown model)",
+                        fixture.subagent_id
+                    )
         ));
         assert!(matches!(
             updates.last(),
