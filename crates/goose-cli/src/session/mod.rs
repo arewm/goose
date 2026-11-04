@@ -977,9 +977,9 @@ impl CliSession {
         instructions: Option<String>,
         pool_only: bool,
     ) -> Result<crate::commands::review::ReviewOptions> {
-        let provider = self.agent.provider(&self.session_id).await?;
+        let provider = self.services.provider(&self.session_id).await?;
         let model_config = self
-            .agent
+            .services
             .model_config_for_session(&self.session_id)
             .await?;
         Ok(crate::commands::review::ReviewOptions {
@@ -1123,7 +1123,7 @@ impl CliSession {
                     return Ok(());
                 }
                 match self
-                    .agent
+                    .services
                     .update_thinking_effort(&self.session_id, effort)
                     .await
                 {
@@ -1372,7 +1372,7 @@ impl CliSession {
 
         if let Some(effort) = options.effort.as_deref() {
             match self
-                .agent
+                .services
                 .update_thinking_effort(&self.session_id, effort)
                 .await
             {
@@ -2309,8 +2309,10 @@ impl CliSession {
     /// configuration to complete a turn successfully.
     async fn record_last_good_model(&mut self) {
         if let (Ok(provider), Ok(model_config)) = (
-            self.agent.provider(&self.session_id).await,
-            self.agent.model_config_for_session(&self.session_id).await,
+            self.services.provider(&self.session_id).await,
+            self.services
+                .model_config_for_session(&self.session_id)
+                .await,
         ) {
             self.last_good_model = Some((provider.get_name().to_string(), model_config));
         }
@@ -2326,13 +2328,13 @@ impl CliSession {
             return;
         };
         let current_model = self
-            .agent
+            .services
             .model_config_for_session(&self.session_id)
             .await
             .ok()
             .map(|config| config.model_name);
         let current_provider = self
-            .agent
+            .services
             .provider(&self.session_id)
             .await
             .ok()
@@ -2345,7 +2347,7 @@ impl CliSession {
         let switched_to = current_model.unwrap_or_else(|| "unknown".to_string());
         let target_model = model_config.model_name.clone();
         match self
-            .agent
+            .services
             .switch_provider(&self.session_id, &provider_name, model_config)
             .await
         {
