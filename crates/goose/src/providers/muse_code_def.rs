@@ -799,7 +799,18 @@ mod tests {
             .fetch_supported_models()
             .await
             .expect("models should be fetched from the configured host");
-        assert_eq!(models, vec!["muse-spark-1.2".to_string()]);
+        // The discovered model from the host is unioned with the statically
+        // declared models.
+        assert_eq!(
+            models,
+            vec![
+                "muse-spark-1.1".to_string(),
+                "muse-spark-1.2".to_string(),
+                "muse-spark-1.2-contributor".to_string(),
+                "muse-spark-1.3".to_string(),
+                "muse-spark-1.3-contributor".to_string(),
+            ]
+        );
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
