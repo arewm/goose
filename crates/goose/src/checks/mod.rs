@@ -882,4 +882,37 @@ tools: [Bash, Read, Grep]
         assert_eq!(result.checks.len(), 1);
         assert!(result.checks[0].body.ends_with("review rules"));
     }
+    #[test]
+    fn resolves_model_precedence() {
+        let mut check = Check::parse(
+            "---\nname: x\nmodel: per-check\n---\n",
+            &p("/r/.agents/checks/x.md"),
+        )
+        .unwrap();
+        assert_eq!(
+            check.resolved_model(Some("default"), None),
+            Some("per-check")
+        );
+        assert_eq!(
+            check.resolved_model(Some("default"), Some("override")),
+            Some("override")
+        );
+        check.model = None;
+        assert_eq!(check.resolved_model(Some("default"), None), Some("default"));
+        assert_eq!(check.resolved_model(None, None), None);
+    }
+
+    #[test]
+    fn resolves_turn_limit() {
+        let mut check = Check::parse(
+            "---\nname: x\nturn-limit: 7\n---\n",
+            &p("/r/.agents/checks/x.md"),
+        )
+        .unwrap();
+        assert_eq!(check.resolved_turn_limit(None), 7);
+        assert_eq!(check.resolved_turn_limit(Some(99)), 7);
+        check.turn_limit = None;
+        assert_eq!(check.resolved_turn_limit(Some(99)), 99);
+        assert_eq!(check.resolved_turn_limit(None), DEFAULT_CHECK_TURN_LIMIT);
+    }
 }

@@ -3135,6 +3135,83 @@ mod tests {
     use super::*;
 
     #[test]
+    fn review_command_accepts_options() {
+        let cli = Cli::try_parse_from([
+            "goose",
+            "review",
+            "origin/main...HEAD",
+            "--prompt",
+            "REVIEW.md",
+            "--model",
+            "test-model",
+            "--provider",
+            "openai",
+            "--override-model",
+            "check-model",
+            "--turn-limit",
+            "4",
+            "--dry-run",
+            "--quiet",
+            "--no-orchestrate",
+            "--instructions",
+            "focus on correctness",
+            "--files",
+            "src/lib.rs",
+            "--check-filter",
+            "security",
+            "--check-scope",
+            ".agents",
+            "--checks-only",
+            "--summary-only",
+            "--severity",
+            "low",
+        ])
+        .expect("parse failed");
+
+        match cli.command {
+            Some(Command::Review {
+                range,
+                prompt,
+                model,
+                provider,
+                override_model,
+                turn_limit,
+                dry_run,
+                quiet,
+                no_orchestrate,
+                instructions,
+                files,
+                check_filter,
+                check_scope,
+                checks_only,
+                summary_only,
+                severity,
+            }) => {
+                assert_eq!(range.as_deref(), Some("origin/main...HEAD"));
+                assert_eq!(prompt.as_deref(), Some(std::path::Path::new("REVIEW.md")));
+                assert_eq!(model.as_deref(), Some("test-model"));
+                assert_eq!(provider.as_deref(), Some("openai"));
+                assert_eq!(override_model.as_deref(), Some("check-model"));
+                assert_eq!(turn_limit, Some(4));
+                assert!(dry_run);
+                assert!(quiet);
+                assert!(no_orchestrate);
+                assert_eq!(instructions.as_deref(), Some("focus on correctness"));
+                assert_eq!(files, vec!["src/lib.rs"]);
+                assert_eq!(check_filter, vec!["security"]);
+                assert_eq!(
+                    check_scope.as_deref(),
+                    Some(std::path::Path::new(".agents"))
+                );
+                assert!(checks_only);
+                assert!(summary_only);
+                assert_eq!(severity, "low");
+            }
+            _ => panic!("expected review command"),
+        }
+    }
+
+    #[test]
     fn completion_command_accepts_nushell_alias() {
         let cli = Cli::try_parse_from(["goose", "completion", "nushell"]).expect("parse failed");
 
