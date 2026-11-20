@@ -1235,7 +1235,7 @@ async fn concurrent_subagents_get_their_own_answers_for_the_same_tool_call_id() 
         );
     // User denials distinguish approval denials from inspection denials.
     api.on("Approval was denied or cancelled").call(
-        crate::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME,
+        oi_kit_agent::final_output::FINAL_OUTPUT_TOOL_NAME,
         json!({ "summary": "denied one stopped" }),
     );
     api.on("denied one stopped").reply("both are back");

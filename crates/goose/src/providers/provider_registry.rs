@@ -1,5 +1,8 @@
 use super::api_client::TlsConfig;
-use super::base::{ConfigKey, ModelInfo, Provider, ProviderDef, ProviderMetadata, ProviderType};
+use super::base::{
+    find_declared_model, ConfigKey, ModelInfo, Provider, ProviderDef, ProviderMetadata,
+    ProviderType,
+};
 use super::inventory::{InventoryIdentityInput, InventoryRegistration, InventoryResolvers};
 use crate::config::{DeclarativeProviderConfig, ExtensionConfig};
 use anyhow::Result;

@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 /// by these checks should be attributed to the originating `REVIEW.md`.
 pub const REVIEW_MD_CHECK_PREFIX: &str = "repo-rules";
 
+/// Default turn limit for orchestrated review checks that do not declare one.
+pub const DEFAULT_CHECK_TURN_LIMIT: usize = 25;
+
 /// Parsed YAML frontmatter for a check file.
 #[derive(Debug, Deserialize, Default)]
 struct CheckFrontmatter {
@@ -148,6 +151,31 @@ impl Check {
         Ok(())
     }
 
+    /// Resolve which model this check should use.
+    ///
+    /// `override_model` (CLI `--override-model`) wins over everything; otherwise
+    /// the per-check `model` wins; otherwise `default_model` (CLI `--model`).
+    pub fn resolved_model<'a>(
+        &'a self,
+        default_model: Option<&'a str>,
+        override_model: Option<&'a str>,
+    ) -> Option<&'a str> {
+        if let Some(m) = override_model {
+            return Some(m);
+        }
+        if let Some(m) = self.model.as_deref() {
+            return Some(m);
+        }
+        default_model
+    }
+
+    /// Resolve the turn limit for this check.
+    pub fn resolved_turn_limit(&self, default_turn_limit: Option<usize>) -> usize {
+        self.turn_limit
+            .or(default_turn_limit)
+            .unwrap_or(DEFAULT_CHECK_TURN_LIMIT)
+    }
+
     /// Render this check as a generic [`SourceEntry`] so it can flow through
     /// the same listing/UI pipeline as skills and projects. Checks surface as
     /// [`SourceType::Agent`] entries — they're sub-agent definitions
@@ -165,6 +193,7 @@ impl Check {
         if let Some(n) = self.turn_limit {
             properties.insert("turnLimit".into(), serde_json::Value::from(n));
         }
+
         if let Some(t) = &self.tools {
             properties.insert(
                 "tools".into(),

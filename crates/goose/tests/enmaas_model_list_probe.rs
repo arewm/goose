@@ -5,7 +5,7 @@
 use goose::config::Config;
 use goose::providers::base::Provider;
 use goose::providers::custom_provider_config::ConfigKeyResolver;
-use goose_providers::declarative::{load_custom_providers, ProviderEngine};
+use oi_kit_providers::declarative::{load_custom_providers, ProviderEngine};
 
 #[tokio::test]
 #[ignore]
@@ -24,7 +24,7 @@ async fn fetch_models_from_enmaas_providers() {
                 goose::providers::openai_def::from_custom_config(config.clone(), None)
                     .map(|p| p.fetch_boxed())
             }
-            ProviderEngine::Anthropic => goose_providers::anthropic::from_declarative_config(
+            ProviderEngine::Anthropic => oi_kit_providers::anthropic::from_declarative_config(
                 config.clone(),
                 None,
                 ConfigKeyResolver::new(Config::global()),
@@ -46,13 +46,13 @@ trait FetchBoxed {
     fn fetch_boxed(self) -> Box<dyn Provider>;
 }
 
-impl FetchBoxed for goose_providers::openai::OpenAiProvider {
+impl FetchBoxed for oi_kit_providers::openai::OpenAiProvider {
     fn fetch_boxed(self) -> Box<dyn Provider> {
         Box::new(self)
     }
 }
 
-impl FetchBoxed for goose_providers::anthropic::AnthropicProvider {
+impl FetchBoxed for oi_kit_providers::anthropic::AnthropicProvider {
     fn fetch_boxed(self) -> Box<dyn Provider> {
         Box::new(self)
     }

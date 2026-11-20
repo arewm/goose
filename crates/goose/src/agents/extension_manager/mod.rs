@@ -255,6 +255,14 @@ impl ExtensionManager {
         }
     }
 
+    pub fn with_data_dir(data_dir: std::path::PathBuf) -> Self {
+        let session_manager = Arc::new(SessionManager::new(data_dir));
+        Self::new(
+            session_manager,
+            client_context(&GoosePlatform::GooseCli, None),
+        )
+    }
+
     /// The latest client to attach to a session is the one its extensions start for from
     /// then on.
     pub fn attach_client(&self, session_id: &str, client: ClientContext) {

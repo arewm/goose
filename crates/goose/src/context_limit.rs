@@ -13,11 +13,11 @@ pub async fn get_context_limit(provider: &dyn Provider, model: &str) -> Result<u
     // model (falls to canonical/128k) but another custom_providers entry does,
     // use it. Do not override provider-local configured limits.
     let provider_limit = provider.get_context_limit(model, None).await;
-    if provider_limit != goose_providers::model::DEFAULT_CONTEXT_LIMIT {
+    if provider_limit != oi_kit_providers::model::DEFAULT_CONTEXT_LIMIT {
         return Ok(provider_limit);
     }
     let global_limit = {
-        let custom = goose_providers::declarative::load_custom_providers(
+        let custom = oi_kit_providers::declarative::load_custom_providers(
             &crate::config::declarative_providers::custom_providers_dir(),
         )
         .unwrap_or_default();
@@ -60,7 +60,7 @@ pub fn get_local_context_limit(provider_name: &str, model: &str) -> Result<usize
     // model patches the limit regardless of which provider discovered it (EnMaaS
     // single endpoint advertises same IDs on both engines).
     {
-        let global_limits = goose_providers::declarative::load_custom_providers(
+        let global_limits = oi_kit_providers::declarative::load_custom_providers(
             &crate::config::declarative_providers::custom_providers_dir(),
         )
         .unwrap_or_default()

@@ -258,7 +258,7 @@ pub struct CliSession {
     /// Last (provider, model) that completed a turn successfully. A request
     /// failure after a mid-session `/model` switch reverts to this so a bad
     /// switch cannot brick the session.
-    last_good_model: Option<(String, goose_providers::model::ModelConfig)>,
+    last_good_model: Option<(String, oi_kit_providers::model::ModelConfig)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -15,8 +15,6 @@ pub(crate) trait ToolAccess: Send + Sync {
         request: crate::agents::extension_manager::CallRequest,
         cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<ToolCallResult, rmcp::model::ErrorData>;
-
-
 }
 
 #[cfg(test)]

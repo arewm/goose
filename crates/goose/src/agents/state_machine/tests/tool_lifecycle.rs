@@ -12,7 +12,7 @@ use super::pipeline::MessageKind::{Agent, Confirmation, Error, ToolCall, ToolRes
 use super::pipeline::TestPipeline;
 use super::pipeline::MAX_TURNS;
 use super::test_pipeline;
-use crate::agents::tool_execution::{APPROVAL_DENIAL_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE};
+use crate::agents::tool_execution::APPROVAL_DENIAL_RESPONSE;
 use crate::agents::AgentEvent;
 use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;

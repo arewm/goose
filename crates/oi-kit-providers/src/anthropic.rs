@@ -20,10 +20,10 @@ use super::base::{
 };
 pub use super::formats::anthropic::AnthropicFormatOptions;
 use super::formats::anthropic::{
-    block_binding_behavior, create_request_for_model, error_for_type,
-    is_not_multimodal_error, is_reserved_request_param_key, is_thinking_signature_error,
-    response_to_streaming_message, PrefixMismatchBehavior, ANTHROPIC_PROVIDER_NAME,
-    INPUT_TRANSFORMATIONS_FIELD, THINKING_BINDING_CONTROLS_BETA,
+    block_binding_behavior, create_request_for_model, error_for_type, is_not_multimodal_error,
+    is_reserved_request_param_key, is_thinking_signature_error, response_to_streaming_message,
+    PrefixMismatchBehavior, ANTHROPIC_PROVIDER_NAME, INPUT_TRANSFORMATIONS_FIELD,
+    THINKING_BINDING_CONTROLS_BETA,
 };
 use super::openai_compatible::handle_status;
 use super::retry::ProviderRetry;

@@ -121,7 +121,8 @@ pub async fn check_if_compaction_needed(
         .unwrap_or_else(|| ModelConfig::new("unknown"));
     let context_limit =
         crate::context_limit::get_context_limit(provider, &model_config.model_name).await?;
-    let threshold = threshold_override.unwrap_or_else(|| auto_compact_threshold(context_limit));
+    let threshold =
+        threshold_override.unwrap_or_else(|| auto_compact_threshold(&model_config, context_limit));
 
     let (current_tokens, _token_source) = match session.usage.total_tokens {
         Some(tokens) => (tokens as usize, "session metadata"),
